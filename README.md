@@ -4,8 +4,7 @@
 
 **A VPN-whitelist guard for Claude on macOS.**
 
-Blocks the `claude.ai` site, the **Claude Desktop** app and the **Claude Code CLI** (`claude`)
-whenever your public IP is not on your VPN whitelist — so you never touch Claude from the wrong region by accident.
+Blocks the **Claude Desktop** app, the **Claude Code CLI** (`claude`) and every Claude/Anthropic domain (`claude.ai`, `claude.com`, `anthropic.com` and all their subdomains) whenever your public IP is not on your VPN whitelist - so you never touch Claude from the wrong region by accident.
 
 **English** · [Русский](README.ru.md)
 
@@ -15,47 +14,42 @@ whenever your public IP is not on your VPN whitelist — so you never touch Clau
 
 ## Why
 
-If your account is region-sensitive, a single request from a non-VPN IP can get you flagged.
-ClaudeGuard makes that mistake impossible: every launch and every running session is checked against your
-whitelist of VPN IPs, and access is cut the instant you fall off it.
+If your account is region-sensitive, a single request from the wrong IP can get your account flagged.
+ClaudeGuard solves that: every launch and every running session is checked against your whitelist of allowed IPs, and access is cut the instant you fall off it.
 
 ## Features
 
-- 🔐 **IP whitelist** — Claude opens **only** when your public IP matches one of your VPN nodes.
-- ⏱ **Instant pre-flight check** — launching `claude` or `Claude.app` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted → blocked before anything connects.
-- 🧠 **One brain, one verdict** — a background daemon publishes the decision to a state file; the CLI, the app launcher and the menu bar all read the same verdict, so nothing can disagree.
+- 🔐 **IP whitelist** - Claude opens **only** when your public IP matches one of your VPN nodes.
+- ⏱ **Instant pre-flight check** - launching `claude` or `Claude.app` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted → blocked before anything connects.
+- 🧠 **One brain, one verdict** - a background daemon publishes the decision to a state file; the CLI, the app launcher and the menu bar all read the same verdict, so nothing can disagree.
 - 🚀 **Autostart at login** via `LaunchAgent`.
-- 🟢 **Menu bar UI** — live status (🟢 protected / 🔴 blocked / ⚪ offline / 🟡 off), toggles, one-click whitelist.
-- ❄️ **Freeze auto-updates** — blocks Claude's update servers and locks the update dirs.
+- 🟢 **Menu bar UI** - live status (🟢 protected / 🔴 blocked / ⚪ offline / 🟡 off), toggles, one-click whitelist.
+- ❄️ **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
 
 ## Install
 
 The installer compiles the native binaries (Swift + C) **on your machine**. Locally-compiled binaries
-carry no quarantine flag, so **Gatekeeper never blocks them** — no Apple Developer account, no code-signing,
+carry no quarantine flag, so **Gatekeeper never blocks them** - no Apple Developer account, no code-signing,
 no notarization, no Homebrew. The only requirement is Xcode Command Line Tools (the installer offers to
 install them if missing).
 
-**Get the folder, then run:**
+Two ways to install - both give the exact same result.
 
-```bash
-./install.sh
-```
-
-It compiles for your architecture (Apple Silicon or Intel), installs the menu bar daemon at login,
-wraps the `claude` command, and asks for your password once (`sudo` is needed to edit `/etc/hosts` and pf).
-At the end it offers to whitelist your current IP — accept **only if you are on your VPN right now.**
-
-<details>
-<summary>Optional: one-line install from GitHub</summary>
-
-The same `install.sh` can fetch and build the source itself:
+**Option 1 - one line** (downloads and builds from GitHub):
 
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ivblz/ClaudeGuard/main/install.sh)"
 ```
 
-Running locally from the folder never touches GitHub.
-</details>
+**Option 2 - from a local copy** (a cloned or downloaded repo; never touches GitHub):
+
+```bash
+./install.sh
+```
+
+Either way it compiles for your architecture (Apple Silicon or Intel), installs the menu bar daemon at login,
+and wraps the `claude` command. It asks for your password once (`sudo` is needed to edit `/etc/hosts` and pf)
+and offers to whitelist your current IP - accept **only if you are on your VPN right now.**
 
 **Uninstall:**
 
@@ -81,10 +75,10 @@ After install the `claudeguard` command is available:
 
 ## How it works
 
-1. **STUN-first IP detection** — the public IP is resolved via a single UDP STUN round-trip (tens of ms), falling back to HTTP echo services on networks that block UDP.
-2. **The brain** (`src/brain.py`) turns that IP into one verdict — `allowed` / `blocked` / `offline` — and it **fails closed**: only a confirmed `allowed` lets Claude run.
-3. **Single source of truth** — the menu bar daemon writes its verdict to `~/.config/claudeguard/state.json` on every check. The CLI wrapper and app launcher read it (instant), and fall back to their own check only if the daemon is down.
-4. **Enforcement** — domains are blocked via `/etc/hosts` + a pf firewall rule (TCP + UDP/QUIC); the desktop app is force-quit with an alert; a running `claude` session is killed the moment the IP leaves the whitelist.
+1. **STUN-first IP detection** - the public IP is resolved via a single UDP STUN round-trip (tens of ms), falling back to HTTP echo services on networks that block UDP.
+2. **The brain** (`src/brain.py`) turns that IP into one verdict - `allowed` / `blocked` / `offline` - and it **fails closed**: only a confirmed `allowed` lets Claude run.
+3. **Single source of truth** - the menu bar daemon writes its verdict to `~/.config/claudeguard/state.json` on every check. The CLI wrapper and app launcher read it (instant), and fall back to their own check only if the daemon is down.
+4. **Enforcement** - the whole Claude/Anthropic domain family (~175 hosts across 5 apex domains) is blocked via `/etc/hosts` + a pf firewall rule (TCP + UDP/QUIC); the desktop app is force-quit with an alert; a running `claude` session is killed the moment the IP leaves the whitelist.
 
 > **Scope:** this is accidental-leak protection for your own machine, not a defense against a malicious admin. The truly unbypassable layer (a Network Extension content filter) requires a paid Apple Developer account; the on-device approach here is the free ceiling and covers accidental leaks well.
 
@@ -109,4 +103,4 @@ uninstall.sh        Clean removal, restores the original `claude`
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
