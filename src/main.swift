@@ -1,0 +1,665 @@
+import AppKit
+import Foundation
+import SystemConfiguration
+import Network
+
+// ClaudeGuard menu bar daemon.
+//
+// State machine: compute one GuardState, touch the system only on transitions
+// (blocking/unblocking domains, killing the app, alerting) — never on every
+// poll. Owns two enforcement surfaces: the Claude Desktop app (force-quit +
+// alert) and the claude/anthropic domains (/etc/hosts + pf). The `claude` CLI
+// enforces itself from src/cli_wrapper.py — a background daemon has no terminal.
+
+enum GuardState: Equatable {
+    case disabled              // protection off
+    case offline               // no internet — can't verify
+    case allowed(ip: String)   // public IP is whitelisted
+    case blocked(ip: String)   // online, IP not whitelisted
+
+    // Fail closed: domains open only on a confirmed good IP; offline blocks too.
+    var domainsShouldBeBlocked: Bool {
+        switch self {
+        case .allowed, .disabled: return false
+        case .blocked, .offline:  return true
+        }
+    }
+}
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var menu: NSMenu!
+
+    var state: GuardState = .offline
+    var currentIP: String = "…"
+    var protectionEnabled: Bool = true
+    var blockAutoUpdates: Bool = true
+    var allowedIPs: [String] = []
+
+    var dynamicStore: SCDynamicStore?
+    var pathMonitor: NWPathMonitor?
+    // Usable network route, from NWPathMonitor — lets us declare "offline" the
+    // instant Wi-Fi drops instead of waiting for HTTP timeouts.
+    var hasNetworkPath: Bool = true
+    var blinkTimer: Timer?
+    var blinkState: Bool = false
+    let checkLock = NSLock()
+    let configPath = NSString(string: "~/.config/claudeguard/config.json").expandingTildeInPath
+
+    // Last enforcement pushed to the system, to skip redundant work. nil = never
+    // applied, force a first apply.
+    var lastAppliedDomainsBlocked: Bool? = nil
+    var lastAppliedBlockUpdates: Bool? = nil
+    // Alerted once for the current blocked episode (reset on leaving blocked).
+    var hasAlertedThisBlock: Bool = false
+
+    // MARK: - Lifecycle
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Single-instance guard. LaunchAgent runs the bare binary, Launchpad
+        // runs the .app — match both names and the bundle id.
+        let myPID = getpid()
+        for app in NSWorkspace.shared.runningApplications where app.processIdentifier != myPID {
+            let name = app.localizedName ?? ""
+            if name == "ClaudeGuardMenuBar" || name == "ClaudeGuard" || app.bundleIdentifier == "com.claudeguard.app" {
+                NSApplication.shared.terminate(nil)
+                return
+            }
+        }
+
+        if let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let iconImage = NSImage(contentsOfFile: iconPath) {
+            NSApplication.shared.applicationIconImage = iconImage
+        }
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        menu = NSMenu()
+        statusItem.menu = menu
+
+        loadConfig()
+        rebuildMenu()
+
+        setupAppLaunchInterceptor()
+
+        // Verify right now; state is unknown until the first check returns.
+        startBlinking()
+        DispatchQueue.global(qos: .userInitiated).async { self.recheck() }
+
+        setupPathMonitor()      // connectivity up/down
+        setupNetworkObserver()  // VPN/route/IP changes while online
+
+        // Fallback poll — catches a public-IP change with no local network event.
+        Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
+            DispatchQueue.global(qos: .background).async { self.recheck() }
+        }
+    }
+
+    // MARK: - Connectivity monitor (Network framework)
+
+    func setupPathMonitor() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let satisfied = (path.status == .satisfied)
+            let changed = (self.hasNetworkPath != satisfied)
+            self.hasNetworkPath = satisfied
+            // Connectivity flipped — re-verify. Down → recheck() declares offline
+            // instantly; up → recheck() runs the IP check.
+            if changed { self.startBlinking() }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + (satisfied ? 0.4 : 0.0)) {
+                self.recheck()
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "com.claudeguard.path"))
+        self.pathMonitor = monitor
+    }
+
+    // MARK: - Real-time network observer
+
+    func setupNetworkObserver() {
+        var context = SCDynamicStoreContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(), retain: nil, release: nil, copyDescription: nil)
+
+        let callback: SCDynamicStoreCallBack = { (_, _, info) in
+            guard let info = info else { return }
+            let me = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+            // Network event fired — don't act blindly, just re-verify once it
+            // settles; recheck() decides.
+            me.startBlinking()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) { me.recheck() }
+        }
+
+        guard let store = SCDynamicStoreCreate(kCFAllocatorDefault, "com.claudeguard.app" as CFString, callback, &context) else { return }
+        self.dynamicStore = store
+        let patterns = [
+            "State:/Network/Global/IPv4",
+            "State:/Network/Global/IPv6",
+            "State:/Network/Interface/.*",
+            "State:/Network/Service/.*"
+        ] as CFArray
+        SCDynamicStoreSetNotificationKeys(store, nil, patterns)
+        if let src = SCDynamicStoreCreateRunLoopSource(kCFAllocatorDefault, store, 0) {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), src, .defaultMode)
+        }
+    }
+
+    // MARK: - Desktop app launch interceptor
+
+    func setupAppLaunchInterceptor() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self = self else { return }
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            let name = app.localizedName ?? ""
+            if name == "Claude" || app.bundleIdentifier == "com.anthropic.claudefor-mac" {
+                guard self.protectionEnabled else { return }
+                // Fail closed on a fresh launch, even offline: an unverified
+                // session must not start.
+                if case .allowed = self.state { return }
+                app.forceTerminate()
+                self.runPkill(target: "Claude.app")
+                let reason: String
+                switch self.state {
+                case .offline: reason = "No internet connection — your IP can't be verified."
+                default:       reason = "Your public IP (\(self.currentIP)) is not in your allowed VPN whitelist."
+                }
+                self.showBlockedAlert(reason: reason)
+            }
+        }
+    }
+
+    // MARK: - Core check
+
+    func recheck() {
+        guard checkLock.try() else { return }
+        defer { checkLock.unlock(); stopBlinking() }
+
+        loadConfig()
+
+        let newState: GuardState
+        if !protectionEnabled {
+            newState = .disabled
+        } else if !hasNetworkPath {
+            // No usable route — offline. Decide instantly instead of hanging on
+            // HTTP timeouts.
+            currentIP = "No Internet"
+            newState = .offline
+        } else {
+            if let ip = resolvePublicIPWithRetry() {
+                currentIP = ip
+                let ok = Self.isIPAllowed(ip, allowedList: allowedIPs)
+                newState = ok ? .allowed(ip: ip) : .blocked(ip: ip)
+            } else {
+                currentIP = "No Internet"
+                newState = .offline
+            }
+        }
+
+        let previous = state
+        state = newState
+        apply(from: previous, to: newState)
+        writeStateFile()  // publish verdict for the CLI wrapper
+
+        DispatchQueue.main.async { self.updateStatusDisplay(); self.rebuildMenu() }
+    }
+
+    /// Publishes the verdict to state.json (single source of truth for the CLI
+    /// wrapper). Written atomically each recheck; a stale file signals the
+    /// daemon is down and the wrapper should fall back to its own check.
+    func writeStateFile() {
+        let stateStr: String
+        switch state {
+        case .allowed:  stateStr = "allowed"
+        case .blocked:  stateStr = "blocked"
+        case .offline:  stateStr = "offline"
+        case .disabled: stateStr = "disabled"
+        }
+        let dict: [String: Any] = [
+            "state": stateStr,
+            "ip": currentIP,
+            "protection_enabled": protectionEnabled,
+            "updated_at": Date().timeIntervalSince1970
+        ]
+        let path = NSString(string: "~/.config/claudeguard/state.json").expandingTildeInPath
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
+            try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        }
+    }
+
+    /// The only place that touches the system. Each piece runs only when its
+    /// input actually changed.
+    func apply(from previous: GuardState, to new: GuardState) {
+        // Domains: /etc/hosts holds both claude-domain and update-domain blocks,
+        // so rewrite when either flips.
+        let wantBlocked = new.domainsShouldBeBlocked
+        let domainsChanged = (lastAppliedDomainsBlocked != wantBlocked)
+        let updatesChanged = (lastAppliedBlockUpdates != blockAutoUpdates)
+
+        if domainsChanged || updatesChanged {
+            lastAppliedDomainsBlocked = wantBlocked
+            runHelper("sync_hosts", wantBlocked ? "true" : "false", String(blockAutoUpdates))
+        }
+
+        // Auto-update lock (chmod/chflags) — only on change.
+        if updatesChanged {
+            lastAppliedBlockUpdates = blockAutoUpdates
+            runHelper("sync_updates", String(blockAutoUpdates), "")
+        }
+
+        // Desktop app kill + alert.
+        switch new {
+        case .blocked:
+            let killed = killDesktopIfRunning()
+            if killed && !hasAlertedThisBlock {   // alert once per blocked episode
+                hasAlertedThisBlock = true
+                showBlockedAlert(reason: "Your public IP (\(currentIP)) is not in your allowed VPN whitelist.")
+            }
+        case .allowed, .disabled, .offline:
+            // offline: don't kill a running app — nothing to protect against.
+            hasAlertedThisBlock = false
+        }
+        _ = previous
+    }
+
+    // MARK: - IP fetch (STUN-first, HTTP fallback, raced)
+
+    let stunServers: [(String, UInt16)] = [
+        ("stun.l.google.com", 19302),
+        ("stun1.l.google.com", 19302),
+        ("stun.cloudflare.com", 3478)
+    ]
+    let httpServices = [
+        "https://api.ipify.org?format=json",
+        "https://ifconfig.me/ip",
+        "https://ipinfo.io/ip",
+        "https://icanhazip.com",
+        "https://api.myip.com"
+    ]
+
+    /// Resolves the public IP with a brief retry — right after a VPN/Wi-Fi
+    /// handshake the route is momentarily unstable, and a single failed lookup
+    /// used to falsely flash "offline".
+    func resolvePublicIPWithRetry() -> String? {
+        for attempt in 0..<2 {
+            if let ip = resolvePublicIP() { return ip }
+            if attempt < 1 { Thread.sleep(forTimeInterval: 0.5) }
+        }
+        return nil
+    }
+
+    /// Races a STUN query against the HTTP IP services in parallel; first valid
+    /// answer wins. STUN wins instantly when online; HTTP covers networks that
+    /// block UDP/STUN. A single ~2s deadline bounds the offline case.
+    func resolvePublicIP() -> String? {
+        let sem = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var result: String? = nil
+        func offer(_ ip: String?) {
+            guard let ip = ip, !ip.isEmpty else { return }
+            lock.lock()
+            let first = (result == nil)
+            if first { result = ip }
+            lock.unlock()
+            if first { sem.signal() }
+        }
+
+        // STUN (fast path)
+        var conns: [NWConnection] = []
+        for (host, port) in stunServers {
+            if let c = stunQuery(host: host, port: port, completion: { offer($0) }) {
+                conns.append(c)
+            }
+        }
+
+        // HTTP (fallback, in parallel)
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = 2.0
+        cfg.timeoutIntervalForResource = 2.0
+        let session = URLSession(configuration: cfg)
+        for service in httpServices {
+            guard let url = URL(string: service) else { continue }
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 2.0)
+            req.setValue("ClaudeGuard/1.0", forHTTPHeaderField: "User-Agent")
+            session.dataTask(with: req) { data, _, err in
+                guard err == nil else { return }
+                offer(Self.parseHTTPIP(data))
+            }.resume()
+        }
+
+        _ = sem.wait(timeout: .now() + 2.0)
+        conns.forEach { $0.cancel() }
+        session.invalidateAndCancel()
+
+        lock.lock(); let ip = result; lock.unlock()
+        return ip
+    }
+
+    static func parseHTTPIP(_ data: Data?) -> String? {
+        guard let data = data,
+              let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !str.isEmpty else { return nil }
+        if str.contains("{"), let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let ip = json["ip"] as? String {
+            return ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        } else if !str.contains("<") {
+            return str
+        }
+        return nil
+    }
+
+    /// Fires one STUN Binding Request over UDP and calls `completion` with the
+    /// mapped public IP (or nil). Returns the live connection so the caller can
+    /// cancel it. Non-blocking.
+    func stunQuery(host: String, port: UInt16, completion: @escaping (String?) -> Void) -> NWConnection? {
+        guard let nwPort = NWEndpoint.Port(rawValue: port) else { completion(nil); return nil }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .udp)
+
+        // STUN Binding Request: type 0x0001, length 0, magic cookie, 12-byte txid.
+        var req = Data([0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42])
+        for _ in 0..<12 { req.append(UInt8.random(in: 0...255)) }
+
+        let lock = NSLock()
+        var done = false
+        func finish(_ ip: String?) {
+            lock.lock()
+            if done { lock.unlock(); return }
+            done = true
+            lock.unlock()
+            completion(ip)
+        }
+
+        conn.stateUpdateHandler = { st in
+            switch st {
+            case .ready:
+                conn.send(content: req, completion: .contentProcessed { err in
+                    if err != nil { finish(nil) }
+                })
+                conn.receiveMessage { data, _, _, _ in
+                    finish(data.flatMap { Self.parseStun([UInt8]($0)) })
+                }
+            case .failed, .cancelled:
+                finish(nil)
+            default:
+                break
+            }
+        }
+        conn.start(queue: DispatchQueue(label: "com.claudeguard.stun"))
+        return conn
+    }
+
+    /// Parses a STUN Binding Success Response, returning the IPv4 from the
+    /// XOR-MAPPED-ADDRESS (0x0020) or plain MAPPED-ADDRESS (0x0001) attribute.
+    static func parseStun(_ b: [UInt8]) -> String? {
+        guard b.count >= 20, b[0] == 0x01, b[1] == 0x01 else { return nil } // 0x0101 success
+        let msgLen = Int(b[2]) << 8 | Int(b[3])
+        let cookie: [UInt8] = [0x21, 0x12, 0xA4, 0x42]
+        var i = 20
+        let end = min(20 + msgLen, b.count)
+        while i + 4 <= end {
+            let attrType = Int(b[i]) << 8 | Int(b[i + 1])
+            let attrLen = Int(b[i + 2]) << 8 | Int(b[i + 3])
+            let vs = i + 4
+            if vs + attrLen > b.count { break }
+            if (attrType == 0x0020 || attrType == 0x0001), attrLen >= 8, b[vs + 1] == 0x01 {
+                let a0, a1, a2, a3: UInt8
+                if attrType == 0x0020 { // XOR-MAPPED: address XOR'd with the magic cookie
+                    a0 = b[vs + 4] ^ cookie[0]
+                    a1 = b[vs + 5] ^ cookie[1]
+                    a2 = b[vs + 6] ^ cookie[2]
+                    a3 = b[vs + 7] ^ cookie[3]
+                } else {
+                    a0 = b[vs + 4]; a1 = b[vs + 5]; a2 = b[vs + 6]; a3 = b[vs + 7]
+                }
+                return "\(a0).\(a1).\(a2).\(a3)"
+            }
+            i = vs + attrLen
+            if attrLen % 4 != 0 { i += 4 - (attrLen % 4) } // pad to 4-byte boundary
+        }
+        return nil
+    }
+
+    /// Matches an IP against exact entries or IPv4 CIDR ranges — mirrors
+    /// ip_checker.py so the daemon and the CLI agree on what's whitelisted.
+    static func isIPAllowed(_ ip: String, allowedList: [String]) -> Bool {
+        for raw in allowedList {
+            let entry = raw.trimmingCharacters(in: .whitespaces)
+            if entry.isEmpty { continue }
+            if entry == ip { return true }
+            if entry.contains("/"), let ipv = ipv4ToUInt32(ip) {
+                let parts = entry.split(separator: "/")
+                if parts.count == 2, let net = ipv4ToUInt32(String(parts[0])), let bits = Int(parts[1]), (0...32).contains(bits) {
+                    let mask: UInt32 = bits == 0 ? 0 : (~UInt32(0)) << (32 - bits)
+                    if (ipv & mask) == (net & mask) { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    static func ipv4ToUInt32(_ ip: String) -> UInt32? {
+        let p = ip.split(separator: ".", omittingEmptySubsequences: false).compactMap { UInt32($0) }
+        guard p.count == 4, p.allSatisfy({ $0 <= 255 }) else { return nil }
+        return (p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]
+    }
+
+    // MARK: - Process control
+
+    func runPkill(target: String) {
+        let t1 = Process()
+        t1.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+        t1.arguments = ["-15", "-f", target]
+        try? t1.run()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.15) {
+            let t2 = Process()
+            t2.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+            t2.arguments = ["-9", "-f", target]
+            try? t2.run()
+        }
+    }
+
+    @discardableResult
+    func killDesktopIfRunning() -> Bool {
+        let running = NSWorkspace.shared.runningApplications.contains {
+            $0.localizedName == "Claude" || $0.bundleIdentifier == "com.anthropic.claudefor-mac"
+        }
+        if running { runPkill(target: "Claude.app") }
+        return running
+    }
+
+    func showBlockedAlert(reason: String) {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "ClaudeGuard 🚫 Blocked"
+            alert.informativeText = "Claude Desktop was closed.\n\n\(reason)"
+            alert.addButton(withTitle: "OK")
+            alert.window.level = .floating
+            alert.runModal()
+        }
+    }
+
+    func runHelper(_ cmd: String, _ a1: String, _ a2: String) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        let script = NSString(string: "~/.local/share/ClaudeGuard/src/helper.py").expandingTildeInPath
+        task.arguments = [script, cmd, a1, a2]
+        try? task.run()
+    }
+
+    // MARK: - Config
+
+    func loadConfig() {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        if let ips = json["allowed_ips"] as? [String] { allowedIPs = ips }
+        if let p = json["protection_enabled"] as? Bool { protectionEnabled = p }
+        if let u = json["block_auto_updates"] as? Bool { blockAutoUpdates = u }
+    }
+
+    func saveConfig() {
+        var json: [String: Any] = [:]
+        if let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)),
+           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] { json = existing }
+        json["allowed_ips"] = allowedIPs
+        json["protection_enabled"] = protectionEnabled
+        json["block_auto_updates"] = blockAutoUpdates
+        if let data = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted) {
+            try? data.write(to: URL(fileURLWithPath: configPath))
+        }
+    }
+
+    // MARK: - UI
+
+    func statusText() -> String {
+        switch state {
+        case .offline:  return "Status: ⚪ Offline (no connection)"
+        case .disabled: return "Status: 🟡 Protection Disabled"
+        case .allowed:  return "Status: 🟢 Protected (VPN OK)"
+        case .blocked:  return "Status: 🔴 BLOCKED (unallowed network)"
+        }
+    }
+
+    func updateStatusDisplay(isDimmed: Bool = false) {
+        guard let button = statusItem.button else { return }
+        button.title = ""
+        button.attributedTitle = NSAttributedString(string: "")
+
+        let symbol: String
+        switch state {
+        case .offline:  symbol = "shield.slash.fill"   // crossed-out shield: nothing to verify against
+        case .disabled: symbol = "shield"
+        case .allowed:  symbol = "lock.shield.fill"
+        case .blocked:  symbol = "xmark.shield.fill"
+        }
+
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "ClaudeGuard")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)) {
+            image.isTemplate = true
+            button.image = image
+            button.image?.accessibilityDescription = statusText()
+            button.alphaValue = isDimmed ? 0.35 : 1.0
+        }
+    }
+
+    func startBlinking() {
+        DispatchQueue.main.async { [self] in
+            guard blinkTimer == nil else { return }
+            blinkState = false
+            blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                self.blinkState.toggle()
+                self.updateStatusDisplay(isDimmed: self.blinkState)
+            }
+        }
+    }
+
+    func stopBlinking() {
+        DispatchQueue.main.async { [self] in
+            blinkTimer?.invalidate()
+            blinkTimer = nil
+            updateStatusDisplay()
+            rebuildMenu()
+        }
+    }
+
+    func rebuildMenu() {
+        menu.removeAllItems()
+
+        let status = NSMenuItem(title: statusText(), action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
+
+        let ipItem = NSMenuItem(title: "🌐 Current IP: \(currentIP)", action: nil, keyEquivalent: "")
+        ipItem.isEnabled = false
+        menu.addItem(ipItem)
+
+        menu.addItem(.separator())
+
+        let recheck = NSMenuItem(title: "🔄 Re-check Now", action: #selector(onRecheck), keyEquivalent: "")
+        recheck.target = self
+        menu.addItem(recheck)
+
+        menu.addItem(.separator())
+
+        let prot = NSMenuItem(title: protectionEnabled ? "✓ Protection Active" : "Protection Disabled", action: #selector(onToggleProtection), keyEquivalent: "")
+        prot.target = self
+        menu.addItem(prot)
+
+        let upd = NSMenuItem(title: blockAutoUpdates ? "✓ Block Auto-Updates" : "Allow Auto-Updates", action: #selector(onToggleUpdates), keyEquivalent: "")
+        upd.target = self
+        menu.addItem(upd)
+
+        menu.addItem(.separator())
+
+        if !currentIP.isEmpty, currentIP != "No Internet", currentIP != "…", !allowedIPs.contains(currentIP) {
+            let add = NSMenuItem(title: "➕ Whitelist Current IP (\(currentIP))", action: #selector(onAddCurrentIP), keyEquivalent: "")
+            add.target = self
+            menu.addItem(add)
+        }
+
+        let manage = NSMenuItem(title: "⚙️ Manage Whitelisted IPs…", action: #selector(onManageIPs), keyEquivalent: "")
+        manage.target = self
+        menu.addItem(manage)
+
+        menu.addItem(.separator())
+
+        let quit = NSMenuItem(title: "Quit ClaudeGuard", action: #selector(onQuit), keyEquivalent: "")
+        quit.target = self
+        menu.addItem(quit)
+    }
+
+    private func recheckAsync() {
+        startBlinking()
+        DispatchQueue.global(qos: .userInitiated).async { self.recheck() }
+    }
+
+    @objc func onRecheck() { recheckAsync() }
+
+    @objc func onToggleProtection() {
+        protectionEnabled.toggle()
+        saveConfig()
+        recheckAsync()
+    }
+
+    @objc func onToggleUpdates() {
+        blockAutoUpdates.toggle()
+        saveConfig()
+        recheckAsync()
+    }
+
+    @objc func onAddCurrentIP() {
+        if !currentIP.isEmpty, !allowedIPs.contains(currentIP), currentIP != "No Internet", currentIP != "…" {
+            allowedIPs.append(currentIP)
+            saveConfig()
+            recheckAsync()
+        }
+    }
+
+    @objc func onManageIPs() {
+        let ipsStr = allowedIPs.joined(separator: ", ")
+        let script = "display dialog \"Enter Whitelisted VPN IPs (comma separated):\" default answer \"\(ipsStr)\" with title \"ClaudeGuard IP Whitelist\""
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try? process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let out = String(data: data, encoding: .utf8), out.contains("text returned:") {
+            let parts = out.components(separatedBy: "text returned:")
+            if parts.count > 1 {
+                let raw = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                allowedIPs = raw.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+                saveConfig()
+                recheckAsync()
+            }
+        }
+    }
+
+    @objc func onQuit() { NSApplication.shared.terminate(nil) }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()
