@@ -43,7 +43,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var hasNetworkPath: Bool = true
     var blinkTimer: Timer?
     var blinkState: Bool = false
+    // Serialize + coalesce rechecks. A plain "drop if busy" lock loses the
+    // network event that arrives mid-check — the classic cause of a boot (or a
+    // VPN handoff) that latches on offline/blocked until a reboot. Instead:
+    // while a check runs, fold new requests into a flag and run one more pass
+    // when it finishes, so the newest event is always acted on.
     let checkLock = NSLock()
+    var checkRunning = false
+    var recheckQueued = false
     let configPath = NSString(string: "~/.config/claudeguard/config.json").expandingTildeInPath
 
     // Last enforcement pushed to the system, to skip redundant work. nil = never
@@ -81,16 +88,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupAppLaunchInterceptor()
 
-        // Verify right now; state is unknown until the first check returns.
+        // Bring the network monitors up first so no early Wi-Fi/VPN transition
+        // is missed, then verify. State is unknown until the first check returns.
+        setupPathMonitor()      // connectivity up/down
+        setupNetworkObserver()  // VPN/route/IP changes while online
+        setupWakeObserver()     // re-verify after the Mac wakes from sleep
+
         startBlinking()
         DispatchQueue.global(qos: .userInitiated).async { self.recheck() }
 
-        setupPathMonitor()      // connectivity up/down
-        setupNetworkObserver()  // VPN/route/IP changes while online
-
-        // Fallback poll — catches a public-IP change with no local network event.
+        // Fallback poll — catches a public-IP change with no local network event,
+        // and (paired with the coalescing recheck) guarantees the daemon
+        // self-heals from a bad boot within one interval instead of needing a
+        // reboot. .utility so the OS won't suspend it the way it can .background.
         Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
-            DispatchQueue.global(qos: .background).async { self.recheck() }
+            DispatchQueue.global(qos: .utility).async { self.recheck() }
         }
     }
 
@@ -142,6 +154,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    // MARK: - Wake-from-sleep
+
+    /// After the Mac wakes, the route and VPN re-establish over several seconds
+    /// and NWPathMonitor may not emit a clean transition. Fire a few staggered
+    /// rechecks so we never sit on a stale pre-sleep verdict.
+    func setupWakeObserver() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self = self else { return }
+            self.startBlinking()
+            for delay in [0.5, 3.0, 8.0] {
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + delay) {
+                    self.recheck()
+                }
+            }
+        }
+    }
+
     // MARK: - Desktop app launch interceptor
 
     func setupAppLaunchInterceptor() {
@@ -169,22 +200,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Core check
 
     func recheck() {
-        guard checkLock.try() else { return }
-        defer { checkLock.unlock(); stopBlinking() }
+        // Coalescing gate: at most one check runs at a time; a request that
+        // arrives while one is in flight sets a flag so exactly one more pass
+        // runs afterwards. No network event is ever silently dropped, and two
+        // quick config toggles can't leave enforcement out of sync.
+        checkLock.lock()
+        if checkRunning {
+            recheckQueued = true
+            checkLock.unlock()
+            return
+        }
+        checkRunning = true
+        checkLock.unlock()
 
+        while true {
+            checkLock.lock(); recheckQueued = false; checkLock.unlock()
+
+            performCheck()
+
+            checkLock.lock()
+            if recheckQueued { checkLock.unlock(); continue }
+            checkRunning = false
+            checkLock.unlock()
+            break
+        }
+        stopBlinking()
+    }
+
+    /// One verification pass: resolve the public IP, fold it into a GuardState,
+    /// push enforcement on transitions, publish the verdict.
+    func performCheck() {
         loadConfig()
 
         let newState: GuardState
         if !protectionEnabled {
             newState = .disabled
-        } else if !hasNetworkPath {
-            // No usable route — offline. Decide instantly instead of hanging on
-            // HTTP timeouts.
-            currentIP = "No Internet"
-            newState = .offline
         } else {
-            if let ip = resolvePublicIPWithRetry() {
+            // `hasNetworkPath` is only a *hint* for snappy offline detection —
+            // never a latch. Even when it says "no route" we still attempt a
+            // short resolve, because that flag can go stale across a Wi-Fi/VPN
+            // handoff and would otherwise pin us to offline until a reboot. A
+            // resolved IP always overrides the hint (and repairs it).
+            let ip = hasNetworkPath ? resolvePublicIPWithRetry()
+                                    : resolvePublicIP(deadline: 1.5)
+            if let ip = ip {
                 currentIP = ip
+                if !hasNetworkPath { hasNetworkPath = true }   // hint was stale
                 let ok = Self.isIPAllowed(ip, allowedList: allowedIPs)
                 newState = ok ? .allowed(ip: ip) : .blocked(ip: ip)
             } else {
@@ -277,10 +338,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Resolves the public IP with a brief retry — right after a VPN/Wi-Fi
     /// handshake the route is momentarily unstable, and a single failed lookup
     /// used to falsely flash "offline".
-    func resolvePublicIPWithRetry() -> String? {
-        for attempt in 0..<2 {
-            if let ip = resolvePublicIP() { return ip }
-            if attempt < 1 { Thread.sleep(forTimeInterval: 0.5) }
+    func resolvePublicIPWithRetry(attempts: Int = 2, deadline: TimeInterval = 2.0) -> String? {
+        for attempt in 0..<attempts {
+            if let ip = resolvePublicIP(deadline: deadline) { return ip }
+            if attempt < attempts - 1 { Thread.sleep(forTimeInterval: 0.5) }
         }
         return nil
     }
@@ -288,7 +349,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Races a STUN query against the HTTP IP services in parallel; first valid
     /// answer wins. STUN wins instantly when online; HTTP covers networks that
     /// block UDP/STUN. A single ~2s deadline bounds the offline case.
-    func resolvePublicIP() -> String? {
+    func resolvePublicIP(deadline: TimeInterval = 2.0) -> String? {
         let sem = DispatchSemaphore(value: 0)
         let lock = NSLock()
         var result: String? = nil
@@ -311,12 +372,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // HTTP (fallback, in parallel)
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 2.0
-        cfg.timeoutIntervalForResource = 2.0
+        cfg.timeoutIntervalForRequest = deadline
+        cfg.timeoutIntervalForResource = deadline
         let session = URLSession(configuration: cfg)
         for service in httpServices {
             guard let url = URL(string: service) else { continue }
-            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: 2.0)
+            var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData, timeoutInterval: deadline)
             req.setValue("ClaudeGuard/1.0", forHTTPHeaderField: "User-Agent")
             session.dataTask(with: req) { data, _, err in
                 guard err == nil else { return }
@@ -324,7 +385,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }.resume()
         }
 
-        _ = sem.wait(timeout: .now() + 2.0)
+        _ = sem.wait(timeout: .now() + deadline)
         conns.forEach { $0.cancel() }
         session.invalidateAndCancel()
 
@@ -543,10 +604,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [self] in
             guard blinkTimer == nil else { return }
             blinkState = false
-            blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
+            // Quick, smooth opacity pulse that fades in/out (like the system's
+            // menu-bar input-source switcher) instead of a slow hard blink.
+            blinkTimer = Timer.scheduledTimer(withTimeInterval: 0.16, repeats: true) { [weak self] _ in
+                guard let self = self, let button = self.statusItem.button else { return }
                 self.blinkState.toggle()
-                self.updateStatusDisplay(isDimmed: self.blinkState)
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.14
+                    ctx.allowsImplicitAnimation = true
+                    button.animator().alphaValue = self.blinkState ? 0.45 : 1.0
+                }
             }
         }
     }
@@ -556,6 +623,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             blinkTimer?.invalidate()
             blinkTimer = nil
             updateStatusDisplay()
+            if let button = statusItem.button {
+                NSAnimationContext.runAnimationGroup { ctx in
+                    ctx.duration = 0.14
+                    ctx.allowsImplicitAnimation = true
+                    button.animator().alphaValue = 1.0
+                }
+            }
             rebuildMenu()
         }
     }
@@ -616,12 +690,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func onToggleProtection() {
         protectionEnabled.toggle()
         saveConfig()
+        rebuildMenu()        // reflect the toggle instantly; enforcement follows
         recheckAsync()
     }
 
     @objc func onToggleUpdates() {
         blockAutoUpdates.toggle()
         saveConfig()
+        rebuildMenu()        // reflect the toggle instantly; enforcement follows
         recheckAsync()
     }
 
