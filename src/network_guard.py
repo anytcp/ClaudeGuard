@@ -3,6 +3,7 @@ import os
 import socket
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 HOSTS_PATH = "/etc/hosts"
@@ -12,7 +13,15 @@ BLOCK_FOOTER = "# END CLAUDEGUARD BLOCKS\n"
 UPDATE_HEADER = "# BEGIN CLAUDEGUARD UPDATE BLOCKS\n"
 UPDATE_FOOTER = "# END CLAUDEGUARD UPDATE BLOCKS\n"
 
-PF_RULE_PATH = "/tmp/claudeguard_pf.rule"
+# The user daemon has no root, and we no longer use sudo/sudoers. Instead it
+# stages the desired /etc/hosts + pf rule under this private dir and pokes a
+# trigger file; a root LaunchDaemon (com.claudeguard.helper) watches the trigger
+# and applies the vetted files. See hosts_helper.c and install.sh.
+CONFIG_DIR = os.path.expanduser("~/.config/claudeguard")
+PENDING_DIR = os.path.join(CONFIG_DIR, "pending")
+PENDING_HOSTS = os.path.join(PENDING_DIR, "hosts.tmp")
+PF_RULE_PATH = os.path.join(PENDING_DIR, "pf.rule")
+REQUEST_FILE = os.path.join(PENDING_DIR, "request")
 
 APEX_DOMAINS = [
     "claude.com",
@@ -182,6 +191,8 @@ def sync_hosts_file(block_claude_domains, block_update_domains, config):
 
         final_content = content.rstrip() + "\n\n" + new_blocks if new_blocks else content.rstrip() + "\n"
 
+        _ensure_pending()
+
         # pf rule blocks TCP + UDP (UDP covers HTTP/3 QUIC) to the real server
         # IPs. Using literal IPs (not domain names) is essential: pfctl would
         # otherwise resolve the names through the just-poisoned /etc/hosts and
@@ -221,25 +232,67 @@ def remove_section(text, header, footer):
         text = text[:start] + text[end:]
     return text
 
-def write_hosts(content):
-    """Write /etc/hosts via the privileged helper (or direct when root)."""
-    tmp_path = "/tmp/claudeguard_hosts.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
+def _ensure_pending():
+    """The private staging dir the root helper reads from. 0700 + user-owned is
+    what lets the helper trust its contents (it applies only files owned by the
+    config dir's owner)."""
+    os.makedirs(PENDING_DIR, exist_ok=True)
+    try:
+        os.chmod(PENDING_DIR, 0o700)
+    except OSError:
+        pass
+
+def _atomic_write(path, content):
+    tmp = path + ".new"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+def _apply_as_root():
+    """Direct application when we already are root (installed/run as root, or
+    tests). Mirrors what hosts_helper.c does."""
+    subprocess.run(f"cp '{PENDING_HOSTS}' {HOSTS_PATH} && chmod 644 {HOSTS_PATH}",
+                   shell=True, check=False)
+    subprocess.run("/usr/bin/dscacheutil -flushcache; /usr/bin/killall -HUP mDNSResponder",
+                   shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    if os.path.exists(PF_RULE_PATH):
+        subprocess.run(f"/sbin/pfctl -e -f '{PF_RULE_PATH}' && /sbin/pfctl -F states",
+                       shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    else:
+        subprocess.run("/sbin/pfctl -d; /sbin/pfctl -F states",
+                       shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+def write_hosts(content):
+    """Stage the desired /etc/hosts and signal the root helper to apply it.
+
+    No sudo, no sudoers: the LaunchDaemon com.claudeguard.helper watches the
+    trigger file and runs as root. When we already are root we just apply
+    directly."""
+    _ensure_pending()
+    _atomic_write(PENDING_HOSTS, content)
 
     if os.geteuid() == 0:
-        subprocess.run(f"cp {tmp_path} {HOSTS_PATH} && chmod 644 {HOSTS_PATH} && rm -f {tmp_path}", shell=True, check=False)
-        if os.path.exists(PF_RULE_PATH):
-            subprocess.run(f"pfctl -e -f {PF_RULE_PATH} && pfctl -F states", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        else:
-            subprocess.run("pfctl -d && pfctl -F states", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        _apply_as_root()
         return
 
-    helper = os.path.expanduser("~/.local/share/ClaudeGuard/bin/hosts-helper")
-    if os.path.exists(helper):
-        res = subprocess.run(f"sudo {helper}", shell=True, capture_output=True, text=True)
-        if res.returncode == 0:
-            return
+    # Poke the trigger. Written in place (not renamed) so launchd's kqueue watch
+    # on this exact file survives across pokes.
+    with open(REQUEST_FILE, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+        f.flush()
+        os.fsync(f.fileno())
 
-    cmd = f"sudo cp {tmp_path} {HOSTS_PATH} && sudo chmod 644 {HOSTS_PATH} && rm -f {tmp_path}"
-    subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    # Best-effort confirm: the helper runs near-instantly, but block application
+    # is security-critical, so wait (up to ~3s) until /etc/hosts reflects the
+    # claude-block state we asked for.
+    want_block = BLOCK_HEADER in content
+    for _ in range(30):
+        try:
+            with open(HOSTS_PATH, "r", encoding="utf-8") as f:
+                if (BLOCK_HEADER in f.read()) == want_block:
+                    return
+        except OSError:
+            pass
+        time.sleep(0.1)

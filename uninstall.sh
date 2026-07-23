@@ -32,6 +32,16 @@ echo "--> Stopping running processes..."
 pkill -f "ClaudeGuardMenuBar" 2>/dev/null || true
 pkill -f "ClaudeGuard" 2>/dev/null || true
 
+# 2b. Remove the root network-helper LaunchDaemon + its binary, and disable pf
+echo "--> Removing root network helper (LaunchDaemon)..."
+HELPER_PLIST="/Library/LaunchDaemons/com.claudeguard.helper.plist"
+HELPER_SYS_DIR="/Library/Application Support/ClaudeGuard"
+sudo launchctl bootout system "$HELPER_PLIST" 2>/dev/null || sudo launchctl unload "$HELPER_PLIST" 2>/dev/null || true
+sudo rm -f "$HELPER_PLIST" 2>/dev/null || true
+sudo rm -rf "$HELPER_SYS_DIR" 2>/dev/null || true
+sudo /sbin/pfctl -d 2>/dev/null || true
+sudo /sbin/pfctl -F states 2>/dev/null || true
+
 # 3. Restore /etc/hosts file
 echo "--> Restoring /etc/hosts and DNS settings..."
 python3 -c "

@@ -21,7 +21,13 @@ BRANCH="${CLAUDEGUARD_BRANCH:-main}"
 INSTALL_DIR="$HOME/.local/share/ClaudeGuard"
 APP_BUNDLE="$INSTALL_DIR/ClaudeGuard.app"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.claudeguard.daemon.plist"
-SUDOERS_FILE="/etc/sudoers.d/claudeguard"
+CONFIG_DIR="$HOME/.config/claudeguard"
+# Root privileged-helper: a LaunchDaemon (no sudoers, no setuid). The binary
+# lives in a root-owned dir so it can't be swapped, and it runs only when the
+# trigger file below is touched.
+HELPER_SYS_DIR="/Library/Application Support/ClaudeGuard"
+HELPER_PLIST="/Library/LaunchDaemons/com.claudeguard.helper.plist"
+LEGACY_SUDOERS="/etc/sudoers.d/claudeguard"   # removed on upgrade from old versions
 
 # --- Pretty output ----------------------------------------------------------
 if [ -t 1 ]; then
@@ -226,30 +232,58 @@ pkill -f "ClaudeGuardMenuBar" 2>/dev/null || true
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 launchctl load "$PLIST_PATH" 2>/dev/null || true
 
-# --- 7. Passwordless network helper via scoped sudoers ----------------------
-# hosts-helper is NOT setuid (chmod 750): root comes only from sudo, scoped to
-# this exact path + this one user below.
-info "Configuring the passwordless network helper (needs your password once)…"
-chmod 750 "$INSTALL_DIR/bin/hosts-helper"
-SUDOERS_BODY="$USER ALL=(ALL) NOPASSWD: /bin/cp /tmp/claudeguard_hosts.tmp /etc/hosts
-$USER ALL=(ALL) NOPASSWD: /bin/chmod 644 /etc/hosts
-$USER ALL=(ALL) NOPASSWD: $INSTALL_DIR/bin/hosts-helper"
+# --- 7. Root network helper via a LaunchDaemon (no sudoers) ------------------
+# The user-session daemon has no root; it stages the desired /etc/hosts + pf
+# rule in ~/.config/claudeguard/pending and touches a trigger file. This root
+# LaunchDaemon watches that trigger and applies the vetted files. Needs your
+# password ONCE now (to place the root-owned binary + plist); never again.
+info "Installing the root network helper (LaunchDaemon — needs your password once)…"
+
+# Private staging dir + trigger file the helper watches (must exist before load).
+mkdir -p "$CONFIG_DIR/pending"
+chmod 700 "$CONFIG_DIR/pending"
+[ -f "$CONFIG_DIR/pending/request" ] || : > "$CONFIG_DIR/pending/request"
+
+HELPER_PLIST_BODY="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+    <key>Label</key><string>com.claudeguard.helper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$HELPER_SYS_DIR/hosts-helper</string>
+        <string>$CONFIG_DIR</string>
+    </array>
+    <key>WatchPaths</key>
+    <array><string>$CONFIG_DIR/pending/request</string></array>
+    <key>StandardOutPath</key><string>/tmp/claudeguard-helper.log</string>
+    <key>StandardErrorPath</key><string>/tmp/claudeguard-helper.err</string>
+</dict>
+</plist>"
+
+install_root_helper() {   # $1 = sudo prefix ("" when already root)
+    local S="$1"
+    $S mkdir -p "$HELPER_SYS_DIR"
+    $S cp "$INSTALL_DIR/bin/hosts-helper" "$HELPER_SYS_DIR/hosts-helper"
+    $S chown root:wheel "$HELPER_SYS_DIR" "$HELPER_SYS_DIR/hosts-helper"
+    $S chmod 755 "$HELPER_SYS_DIR/hosts-helper"     # root-owned, not user-writable
+    printf '%s\n' "$HELPER_PLIST_BODY" | $S tee "$HELPER_PLIST" >/dev/null
+    $S chown root:wheel "$HELPER_PLIST"
+    $S chmod 644 "$HELPER_PLIST"
+    $S launchctl bootout system "$HELPER_PLIST" 2>/dev/null || true
+    $S launchctl bootstrap system "$HELPER_PLIST" 2>/dev/null \
+        || $S launchctl load -w "$HELPER_PLIST" 2>/dev/null || true
+}
 
 if [ "$(id -u)" -eq 0 ]; then
-    chmod 644 /etc/hosts 2>/dev/null || true
-    printf '%s\n' "$SUDOERS_BODY" > "$SUDOERS_FILE"; chmod 440 "$SUDOERS_FILE"
+    rm -f "$LEGACY_SUDOERS" 2>/dev/null || true
+    install_root_helper ""
 else
-    sudo chmod 644 /etc/hosts 2>/dev/null || true
-    printf '%s\n' "$SUDOERS_BODY" | sudo tee "$SUDOERS_FILE" >/dev/null
-    sudo chmod 440 "$SUDOERS_FILE"
+    sudo rm -f "$LEGACY_SUDOERS" 2>/dev/null || true   # drop old NOPASSWD entry if upgrading
+    install_root_helper "sudo"
 fi
-if have visudo; then
-    if [ "$(id -u)" -eq 0 ]; then
-        visudo -c -f "$SUDOERS_FILE" >/dev/null || { warn "sudoers fragment failed validation, removing."; rm -f "$SUDOERS_FILE"; }
-    else
-        sudo visudo -c -f "$SUDOERS_FILE" >/dev/null || { warn "sudoers fragment failed validation, removing."; sudo rm -f "$SUDOERS_FILE"; }
-    fi
-fi
+# The compiled copy in the user dir is never executed now; drop it.
+rm -f "$INSTALL_DIR/bin/hosts-helper" 2>/dev/null || true
 
 # --- 8. First-run: offer to whitelist the current public IP -----------------
 # Best done while you're connected to your VPN right now.

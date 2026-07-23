@@ -94,7 +94,7 @@ src/
   cli_wrapper.py    Pre-flight interceptor for the `claude` command
   app_launcher.py   Pre-flight interceptor for Claude.app
   main.swift        Native menu bar daemon (AppKit): monitoring, alerts, state file
-  hosts_helper.c    Privileged helper (via sudo, not setuid) that writes /etc/hosts + pf
+  hosts_helper.c    Root helper run by a LaunchDaemon (no sudoers, no setuid); writes /etc/hosts + pf
 bin/claudeguard     Management CLI
 assets/AppIcon.png  App icon
 install.sh          Compiles natively on-device and installs everything

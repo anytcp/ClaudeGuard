@@ -94,7 +94,7 @@ src/
   cli_wrapper.py    Pre-flight перехватчик команды `claude`
   app_launcher.py   Pre-flight перехватчик Claude.app
   main.swift        Нативный меню-бар демон (AppKit): мониторинг, алерты, state-файл
-  hosts_helper.c    Привилегированный хелпер (через sudo, без setuid): пишет /etc/hosts + pf
+  hosts_helper.c    Root-хелпер, запускается LaunchDaemon (без sudoers и setuid): пишет /etc/hosts + pf
 bin/claudeguard     CLI управления
 assets/AppIcon.png  Иконка приложения
 install.sh          Компилирует нативно на устройстве и всё ставит
