@@ -1,6 +1,9 @@
+import ipaddress
 import os
+import socket
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 HOSTS_PATH = "/etc/hosts"
 BLOCK_HEADER = "# BEGIN CLAUDEGUARD BLOCKS\n"
@@ -34,6 +37,107 @@ KNOWN_RESOLVED_DOMAINS = [
     "anthropic.com", "www.anthropic.com", "api.anthropic.com", "assets.anthropic.com", "console.anthropic.com", "docs.anthropic.com", "support.anthropic.com", "feedback.anthropic.com", "desktop-app-updates.anthropic.com", "a-api.anthropic.com", "a-cdn.anthropic.com", "status.anthropic.com", "events.anthropic.com", "portal.anthropic.com", "assets-proxy.anthropic.com", "billing.anthropic.com",
     "anthropic.ai", "www.anthropic.ai", "app.anthropic.ai", "api.anthropic.ai", "auth.anthropic.ai"
 ]
+
+# External resolvers used to find the *real* server IPs. dig queries them
+# directly and never consults /etc/hosts, so it still works after we've poisoned
+# the hosts file with 0.0.0.0 entries.
+EXTERNAL_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+
+# Anthropic's own address ranges. pf only ever blocks IPs inside these, so an
+# auxiliary page hosted on a shared CDN (e.g. the status page on CloudFront, the
+# trust page on Cloudflare) never drags unrelated sites down with it. Every
+# account-critical domain (claude.ai, app/api/console/auth/login.*) lives here.
+ANTHROPIC_NETS = [
+    ipaddress.ip_network("160.79.104.0/24"),
+    ipaddress.ip_network("2607:6bc0::/32"),
+]
+
+# Fallback for when external DNS is unreachable, so pf still has something to drop.
+FALLBACK_IPS = ["160.79.104.10", "2607:6bc0::10"]
+
+# Small set of domains that actually exist and share Anthropic's dedicated IPs.
+# pf blocks by IP, so resolving these is enough to discover every address the
+# whole domain family sits on — no need to query dozens of subdomains, most of
+# which are NXDOMAIN and just slow the block down.
+PF_RESOLVE_DOMAINS = [
+    "claude.ai", "www.claude.ai", "app.claude.ai", "api.claude.ai", "auth.claude.ai",
+    "claude.com", "www.claude.com", "app.claude.com", "api.claude.com", "console.claude.com",
+    "anthropic.com", "www.anthropic.com", "api.anthropic.com", "console.anthropic.com",
+]
+
+def _is_ip(text):
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, text)
+            return True
+        except OSError:
+            pass
+    return False
+
+def _in_anthropic_range(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in ANTHROPIC_NETS)
+
+def _dig(resolver, record_type, domain):
+    """Returns (query_succeeded, ips). query_succeeded is False only when the
+    resolver itself failed (timeout/unreachable) — an NXDOMAIN is a *successful*
+    query with an empty answer, and must not trigger a pointless retry."""
+    dig_bin = "/usr/bin/dig" if os.path.exists("/usr/bin/dig") else "dig"
+    try:
+        res = subprocess.run(
+            [dig_bin, f"@{resolver}", "+short", "+time=1", "+tries=1", record_type, domain],
+            capture_output=True, text=True, timeout=3
+        )
+    except Exception:
+        return False, []
+    if res.returncode != 0:
+        return False, []
+    ips = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        # +short can emit CNAME lines (trailing dot) — keep only literal IPs.
+        if line and not line.endswith(".") and _is_ip(line):
+            ips.append(line)
+    return True, ips
+
+def _resolve_one(domain):
+    """A + AAAA for one domain. Batched dig is flaky, so it's one query each;
+    per record type we stop at the first resolver that answers at all, only
+    falling through to the next when a resolver is unreachable (an NXDOMAIN is a
+    successful, empty answer and ends the loop)."""
+    ips = set()
+    for record_type in ("A", "AAAA"):
+        for resolver in EXTERNAL_RESOLVERS:
+            ok, found = _dig(resolver, record_type, domain)
+            if ok:
+                ips.update(found)
+                break
+    return ips
+
+def resolve_ips(domains):
+    """Resolve domains to literal IPv4+IPv6 via external DNS, bypassing the
+    poisoned /etc/hosts. Domains are resolved in parallel to keep the block
+    transition fast — a long resolve is a leak window before pf loads. This is
+    what lets pf block the real servers even when a browser uses DoH and ignores
+    the hosts file."""
+    domains = list(domains)
+    if not domains:
+        return set()
+    ips = set()
+    with ThreadPoolExecutor(max_workers=min(16, len(domains))) as pool:
+        for found in pool.map(_resolve_one, domains):
+            ips.update(found)
+    return ips
+
+def resolve_domain_ips(domains):
+    """The pf target set: Anthropic-owned IPs only (never a shared CDN), plus a
+    fallback so a DNS outage can't leave pf with an empty table."""
+    ips = {ip for ip in resolve_ips(domains) if _in_anthropic_range(ip)}
+    ips.update(FALLBACK_IPS)
+    return sorted(ips)
 
 def generate_all_subdomains():
     domains = set(KNOWN_RESOLVED_DOMAINS)
@@ -78,10 +182,23 @@ def sync_hosts_file(block_claude_domains, block_update_domains, config):
 
         final_content = content.rstrip() + "\n\n" + new_blocks if new_blocks else content.rstrip() + "\n"
 
-        # pf rule blocks TCP + UDP (UDP covers HTTP/3 QUIC).
+        # pf rule blocks TCP + UDP (UDP covers HTTP/3 QUIC) to the real server
+        # IPs. Using literal IPs (not domain names) is essential: pfctl would
+        # otherwise resolve the names through the just-poisoned /etc/hosts and
+        # build a table full of 0.0.0.0. Resolving via external DNS also means
+        # the block holds even when the browser uses DoH and skips /etc/hosts.
         if block_claude_domains:
-            dom_space = " ".join(KNOWN_RESOLVED_DOMAINS)
-            pf_content = f"table <claude_guard> persist {{ {dom_space} }}\nblock drop out proto {{ tcp, udp }} to <claude_guard> port {{ 80, 443 }}\n"
+            ip_set = set(resolve_domain_ips(PF_RESOLVE_DOMAINS))
+            # User-added custom domains are explicit intent — block whatever they
+            # resolve to, no Anthropic-range filter.
+            custom = config.config.get("blocked_domains", [])
+            if custom:
+                ip_set.update(resolve_ips(custom))
+            table_body = " ".join(sorted(ip_set))
+            pf_content = (
+                f"table <claude_guard> persist {{ {table_body} }}\n"
+                f"block drop out quick proto {{ tcp, udp }} to <claude_guard>\n"
+            )
             with open(PF_RULE_PATH, "w", encoding="utf-8") as f:
                 f.write(pf_content)
         else:
