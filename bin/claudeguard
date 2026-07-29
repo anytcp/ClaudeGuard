@@ -10,6 +10,7 @@ sys.path.insert(0, PROJECT_DIR)
 
 from src.config import ConfigManager
 from src.brain import get_verdict, daemon_is_up, resolve_display_ip
+from src.integrity import cli_hook_status, repair, repair_cli
 from src.network_guard import sync_hosts_file
 from src.update_guard import apply_auto_update_lock
 
@@ -33,6 +34,7 @@ Commands:
   launch-desktop       Launch Claude Desktop with pre-flight IP verification
   start                Start ClaudeGuard Menu Bar App
   stop                 Stop ClaudeGuard Menu Bar App
+  doctor               Check every hook is still attached, and re-attach it
   install-cli-wrapper  Install 'claude' CLI wrapper interceptor into PATH
   set-cli-path <path>  Set the real Claude CLI binary path ClaudeGuard launches
   uninstall            Uninstall ClaudeGuard LaunchAgent and wrappers
@@ -137,8 +139,17 @@ def main():
         subprocess.run(["pkill", "-f", "ClaudeGuardMenuBar"], check=False)
         print("🛑 ClaudeGuard Menu Bar App stopped.")
 
+    elif cmd in ("doctor", "repair"):
+        doctor(config)
+
     elif cmd == "install-cli-wrapper":
-        install_cli_wrapper(config)
+        report = repair_cli(config)
+        for change in report["changed"]:
+            print(f"✅ {change}")
+        for note in report["notes"]:
+            print(f"⚠️  {note}")
+        if not report["changed"] and not report["notes"]:
+            print("✅ 'claude' interceptor already installed and current.")
 
     elif cmd == "set-cli-path":
         if len(sys.argv) < 3:
@@ -157,25 +168,48 @@ def main():
         print_help()
         sys.exit(1)
 
-def install_cli_wrapper(config):
-    target_bin = "/usr/local/bin/claude"
-    if not os.path.exists("/usr/local/bin"):
-        os.makedirs("/usr/local/bin", exist_ok=True)
+def doctor(config):
+    """Report on every hook ClaudeGuard owns, then re-attach whatever came loose.
+    The command to run after Claude Code or Claude Desktop was reinstalled."""
+    print("=== ClaudeGuard Doctor ===\n")
 
-    wrapper_script = os.path.join(PROJECT_DIR, "src", "cli_wrapper.py")
-    
-    # Save original real claude binary path into config if needed
-    real_claude = "/opt/homebrew/bin/claude"
-    if os.path.exists(real_claude):
-        config.config["real_claude_cli_path"] = real_claude
-        config.save_config()
+    report = repair(config)
 
-    cmd = f"sudo ln -sf {wrapper_script} {target_bin} || ln -sf {wrapper_script} {target_bin}"
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    if res.returncode == 0:
-        print(f"✅ Installed CLI wrapper to '{target_bin}' -> '{wrapper_script}'")
+    intercepted, hooks = cli_hook_status()
+    print("Claude Code CLI")
+    if hooks:
+        for hook in hooks:
+            mark = "🟢" if hook["guarded"] else "🔴"
+            where = "" if hook["on_path"] else "  (not on your PATH)"
+            what = "guarded by ClaudeGuard" if hook["guarded"] else "REAL binary — UNGUARDED"
+            print(f"  {mark} {hook['path']} → {what}{where}")
     else:
-        print(f"Error installing CLI wrapper: {res.stderr}")
+        print("  ⚪ no 'claude' command found in any known bin directory")
+    print(f"  Hands off to      : {report['real_cli'] or 'NOT FOUND'}")
+    print(f"  Verdict           : {'🟢 intercepted' if intercepted else '🔴 NOT intercepted'}")
+
+    print("\nClaude Desktop")
+    if report["desktop_app"]:
+        print(f"  🟢 {report['desktop_app']} (guarded by the menu bar daemon)")
+    else:
+        print("  ⚪ not installed")
+
+    print("\nDaemon")
+    print(f"  {'🟢 running' if daemon_is_up() else '🔴 NOT running — run: claudeguard start'}")
+
+    print("\nWebsite blocking")
+    print(f"  {'🟢 /etc/hosts writable by the root helper' if os.path.exists('/Library/LaunchDaemons/com.claudeguard.helper.plist') else '🔴 root helper missing — re-run install.sh'}")
+
+    if report["changed"]:
+        print("\nRepaired:")
+        for change in report["changed"]:
+            print(f"  ✅ {change}")
+    if report["notes"]:
+        print("\nNotes:")
+        for note in report["notes"]:
+            print(f"  ⚠️  {note}")
+    if not report["changed"]:
+        print("\n✅ Nothing to repair.")
 
 if __name__ == "__main__":
     main()

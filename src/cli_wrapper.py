@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.realpath
 
 from src.config import ConfigManager
 from src.brain import get_verdict
+from src.integrity import discover_real_cli, is_our_wrapper, repair_cli
 from src.network_guard import sync_hosts_file
 
 # Re-check cadence while a session runs. Just a local state-file read, so cheap.
@@ -86,6 +87,13 @@ def main():
             print_block_banner(ip, err, "ACCESS DENIED: CLAUDE CLI BLOCKED")
         sys.exit(1)
 
+    # We're hooked on *this* PATH entry, but a reinstall may have taken over the
+    # others. Re-hook them while we know where the real binary is.
+    try:
+        repair_cli(config)
+    except Exception:
+        pass
+
     sync_hosts_file(block_claude_domains=False, block_update_domains=config.block_auto_updates, config=config)
     run_real_claude(config)
 
@@ -123,18 +131,21 @@ def monitor_and_enforce(config, proc, stop_event, block_info):
         return
 
 def run_real_claude(config):
+    # The recorded path is version-stamped on Homebrew, so an update deletes it.
+    # Re-discover when it's gone — or when it points back at this wrapper, which
+    # would fork-bomb the machine.
     real_path = config.real_claude_cli
-    if not os.path.exists(real_path):
-        paths = os.environ.get("PATH", "").split(":")
-        for p in paths:
-            candidate = os.path.join(p, "claude")
-            if os.path.exists(candidate) and os.path.realpath(candidate) != os.path.realpath(__file__):
-                real_path = candidate
-                break
+    if not os.path.exists(real_path) or is_our_wrapper(real_path):
+        real_path = discover_real_cli(config)
+        if real_path:
+            config.config["real_claude_cli_path"] = real_path
+            config.save_config()
 
-    if not os.path.exists(real_path):
-        print(f"[ClaudeGuard] Error: Original Claude CLI binary not found at '{real_path}'", file=sys.stderr)
+    if not real_path or not os.path.exists(real_path):
         force_restore_terminal()
+        print("[ClaudeGuard] Error: the real Claude CLI could not be found.", file=sys.stderr)
+        print("  Run 'claudeguard doctor' to re-detect it, or", file=sys.stderr)
+        print("  'claudeguard set-cli-path /path/to/real/claude' to set it manually.", file=sys.stderr)
         sys.exit(1)
 
     env = os.environ.copy()

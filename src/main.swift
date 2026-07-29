@@ -104,6 +104,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { _ in
             DispatchQueue.global(qos: .utility).async { self.recheck() }
         }
+
+        // Hook self-heal. Separate from recheck() because it guards a different
+        // failure: not a network change, but Claude being reinstalled underneath
+        // us and quietly detaching the guard.
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) { self.runIntegrityRepair() }
+        Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { _ in
+            DispatchQueue.global(qos: .utility).async { self.runIntegrityRepair() }
+        }
+    }
+
+    func runIntegrityRepair() {
+        runHelper("integrity", "", "")
+    }
+
+    /// True when /etc/hosts no longer matches what we last applied — an OS
+    /// update, another tool or a manual edit reverted our block.
+    func hostsDrifted() -> Bool {
+        guard let wantDomains = lastAppliedDomainsBlocked,
+              let wantUpdates = lastAppliedBlockUpdates,
+              let content = try? String(contentsOfFile: "/etc/hosts", encoding: .utf8)
+        else { return false }
+        let hasDomains = content.contains("# BEGIN CLAUDEGUARD BLOCKS")
+        let hasUpdates = content.contains("# BEGIN CLAUDEGUARD UPDATE BLOCKS")
+        return hasDomains != wantDomains || hasUpdates != wantUpdates
+    }
+
+    /// Claude Desktop, matched by bundle-id *prefix* — the exact id has already
+    /// changed once (claudefor-mac → claudefordesktop). The name is only a
+    /// fallback: it's localized, so it can't be the primary test.
+    static func isClaudeDesktop(_ app: NSRunningApplication) -> Bool {
+        if let bundleID = app.bundleIdentifier {
+            if bundleID.hasPrefix("com.claudeguard") { return false }   // never ourselves
+            if bundleID.hasPrefix("com.anthropic.claude") { return true }
+        }
+        return (app.localizedName ?? "") == "Claude"
     }
 
     // MARK: - Connectivity monitor (Network framework)
@@ -179,8 +214,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
             guard let self = self else { return }
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-            let name = app.localizedName ?? ""
-            if name == "Claude" || app.bundleIdentifier == "com.anthropic.claudefor-mac" {
+            if Self.isClaudeDesktop(app) {
                 guard self.protectionEnabled else { return }
                 // Fail closed on a fresh launch, even offline: an unverified
                 // session must not start.
@@ -288,6 +322,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// The only place that touches the system. Each piece runs only when its
     /// input actually changed.
     func apply(from previous: GuardState, to new: GuardState) {
+        // Transition-only enforcement assumes nothing else edits /etc/hosts;
+        // drift means "pretend we never applied anything" and re-apply.
+        if hostsDrifted() {
+            lastAppliedDomainsBlocked = nil
+            lastAppliedBlockUpdates = nil
+        }
+
         // Domains: /etc/hosts holds both claude-domain and update-domain blocks,
         // so rewrite when either flips.
         let wantBlocked = new.domainsShouldBeBlocked
@@ -517,11 +558,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @discardableResult
     func killDesktopIfRunning() -> Bool {
-        let running = NSWorkspace.shared.runningApplications.contains {
-            $0.localizedName == "Claude" || $0.bundleIdentifier == "com.anthropic.claudefor-mac"
-        }
-        if running { runPkill(target: "Claude.app") }
-        return running
+        let victims = NSWorkspace.shared.runningApplications.filter { Self.isClaudeDesktop($0) }
+        guard !victims.isEmpty else { return false }
+        // Terminate the matched processes directly (precise wherever the app was
+        // installed); pkill is the second pass for helpers it spawns.
+        victims.forEach { $0.forceTerminate() }
+        runPkill(target: "Claude.app")
+        return true
     }
 
     func showBlockedAlert(reason: String) {

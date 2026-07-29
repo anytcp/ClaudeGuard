@@ -71,7 +71,21 @@ After install the `claudeguard` command is available:
 | `claudeguard block-updates` / `allow-updates` | Lock / unlock auto-updates |
 | `claudeguard launch-desktop` | Launch Claude Desktop with a pre-flight check |
 | `claudeguard start` / `stop` | Start / stop the menu bar daemon |
+| `claudeguard doctor` | Check every hook is still attached, and re-attach it |
 | `claudeguard set-cli-path <path>` | Point at the real `claude` binary if auto-detect misses it |
+
+### Surviving Claude reinstalls
+
+Reinstalling Claude Code puts the real `claude` binary back over ClaudeGuard's shim,
+and updating it deletes the version-stamped path the shim hands off to - so the guard
+would silently detach while the menu bar still showed 🟢. The same applies to Claude
+Desktop, whose bundle id and update directories have been renamed before.
+
+ClaudeGuard therefore discovers those locations instead of hard-coding them, and
+re-attaches whatever came loose: the daemon self-heals **every 60s**, the `claude`
+wrapper re-hooks on each run, and `/etc/hosts` is re-applied whenever something
+external edits it. Run `claudeguard doctor` to see the state of every hook (and fix
+it immediately) at any time.
 
 ## How it works
 
@@ -91,6 +105,7 @@ src/
   config.py         Config at ~/.config/claudeguard/config.json
   network_guard.py  /etc/hosts + pf firewall block/unblock
   update_guard.py   Freeze/unfreeze Claude auto-updates
+  integrity.py      Finds Claude's real paths; re-attaches hooks after a reinstall
   cli_wrapper.py    Pre-flight interceptor for the `claude` command
   app_launcher.py   Pre-flight interceptor for Claude.app
   main.swift        Native menu bar daemon (AppKit): monitoring, alerts, state file

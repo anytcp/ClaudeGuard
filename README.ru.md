@@ -71,7 +71,20 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/ivblz/ClaudeGuard/main/i
 | `claudeguard block-updates` / `allow-updates` | Заблокировать / разрешить автообновления |
 | `claudeguard launch-desktop` | Запустить Claude Desktop с pre-flight проверкой |
 | `claudeguard start` / `stop` | Запустить / остановить меню-бар демон |
+| `claudeguard doctor` | Проверить, что все перехваты на месте, и переустановить их |
 | `claudeguard set-cli-path <path>` | Указать путь до настоящего `claude`, если автоопределение промахнулось |
+
+### Переустановка Claude нас больше не ломает
+
+Переустановка Claude Code кладёт настоящий бинарник `claude` поверх нашего шима, а
+обновление удаляет версионный путь, на который шим передаёт управление, - защита тихо
+отваливалась, а в меню-баре всё так же горело 🟢. То же самое с Claude Desktop: его
+bundle id и папки автообновления уже переименовывались.
+
+Поэтому ClaudeGuard не хардкодит эти пути, а определяет их сам и переподключает всё,
+что отвалилось: демон чинит себя сам **каждые 60 с**, обёртка `claude` перевешивает
+шимы при каждом запуске, а `/etc/hosts` переприменяется, если его правит кто-то извне.
+Посмотреть состояние всех перехватов (и сразу починить) - `claudeguard doctor`.
 
 ## Как это работает
 
@@ -91,6 +104,7 @@ src/
   config.py         Конфиг в ~/.config/claudeguard/config.json
   network_guard.py  Блок/разблок через /etc/hosts + pf firewall
   update_guard.py   Заморозка/разморозка автообновлений Claude
+  integrity.py      Ищет реальные пути Claude; переподключает перехваты после переустановки
   cli_wrapper.py    Pre-flight перехватчик команды `claude`
   app_launcher.py   Pre-flight перехватчик Claude.app
   main.swift        Нативный меню-бар демон (AppKit): мониторинг, алерты, state-файл

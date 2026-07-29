@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.realpath
 
 from src.config import ConfigManager
 from src.brain import get_verdict
+from src.integrity import discover_desktop_app
 from src.network_guard import sync_hosts_file
 
 def launch_claude_desktop():
@@ -46,11 +47,18 @@ def launch_claude_desktop():
     open_real_app(config)
 
 def open_real_app(config):
+    # Re-discover if the recorded location is stale (app moved or reinstalled).
     app_path = config.real_claude_app
-    if os.path.exists(app_path):
+    if not os.path.exists(app_path):
+        app_path = discover_desktop_app(config)
+        if app_path:
+            config.config["real_claude_app_path"] = app_path
+            config.save_config()
+
+    if app_path and os.path.exists(app_path):
         subprocess.run(["open", "-a", app_path], check=False)
     else:
-        show_mac_alert("ClaudeGuard Error", f"Claude Desktop app not found at '{app_path}'.")
+        show_mac_alert("ClaudeGuard Error", "Claude Desktop app not found. Run 'claudeguard doctor'.")
 
 def show_mac_alert(title, message):
     script = f'display alert "{title}" message "{message}" as critical'

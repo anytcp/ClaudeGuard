@@ -70,31 +70,48 @@ dscacheutil -flushcache 2>/dev/null || true
 sudo killall -HUP mDNSResponder 2>/dev/null || true
 
 # 4. Unlock auto-update folders
+# Globbed: a stale literal bundle id silently unlocks nothing and would leave the
+# update dirs frozen forever.
 echo "--> Unlocking filesystem auto-update locks..."
-SHIPIT_DIR="$HOME/Library/Caches/com.anthropic.claudefor-mac.ShipIt"
-UPDATE_YML="$HOME/Library/Application Support/Claude/app-update.yml"
-if [ -d "$SHIPIT_DIR" ]; then
-    chflags -R nouchg "$SHIPIT_DIR" 2>/dev/null || true
-    chmod -R 755 "$SHIPIT_DIR" 2>/dev/null || true
-fi
-if [ -f "$UPDATE_YML" ]; then
-    chflags nouchg "$UPDATE_YML" 2>/dev/null || true
-    chmod 644 "$UPDATE_YML" 2>/dev/null || true
-fi
+for target in "$HOME/Library/Caches/"com.anthropic.claude*.ShipIt \
+              "$HOME/Library/Application Support/Claude/app-update.yml"; do
+    [ -e "$target" ] || continue
+    chflags -R nouchg "$target" 2>/dev/null || true
+    if [ -d "$target" ]; then
+        chmod -R 755 "$target" 2>/dev/null || true
+    else
+        chmod 644 "$target" 2>/dev/null || true
+    fi
+done
 
-# 5. Restore original Homebrew 'claude' symlink
+# 5. Un-hook 'claude' and restore the real binary
 echo "--> Restoring original 'claude' CLI binary..."
 rm -f "$HOME/.local/bin/claudeguard"
-rm -f "$HOME/.local/bin/claude"
 rm -f "/usr/local/bin/claudeguard" 2>/dev/null || true
-rm -f "/usr/local/bin/claude" 2>/dev/null || true
 
-if [ -n "$REAL_CLAUDE_TARGET" ] && [ -w "/opt/homebrew/bin" ] && [ -f "$REAL_CLAUDE_TARGET" ]; then
-    ln -sf "$REAL_CLAUDE_TARGET" "/opt/homebrew/bin/claude"
-    echo "    Restored /opt/homebrew/bin/claude -> $REAL_CLAUDE_TARGET"
-elif [ -z "$REAL_CLAUDE_TARGET" ]; then
-    echo "    ⚠️  Could not determine the original claude CLI path; leaving /opt/homebrew/bin/claude untouched."
-    echo "       Reinstall Claude Code CLI (e.g. 'brew reinstall --cask claude-code') if 'claude' now points nowhere."
+# Only shims that are actually ours: a blanket rm would delete a real install
+# sitting at the same path (the native installer owns ~/.local/bin/claude).
+for link in "$HOME/.local/bin/claude" "/usr/local/bin/claude" "/opt/homebrew/bin/claude"; do
+    [ -L "$link" ] || continue
+    case "$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$link" 2>/dev/null)" in
+        *cli_wrapper.py) rm -f "$link" && echo "    Removed ClaudeGuard shim: $link" ;;
+    esac
+done
+
+# Put the real binary back where its own installer would have put it.
+if [ -n "$REAL_CLAUDE_TARGET" ] && [ -f "$REAL_CLAUDE_TARGET" ]; then
+    case "$REAL_CLAUDE_TARGET" in
+        /opt/homebrew/*) RESTORE_DIR="/opt/homebrew/bin" ;;
+        /usr/local/*)    RESTORE_DIR="/usr/local/bin" ;;
+        *)               RESTORE_DIR="$HOME/.local/bin" ;;
+    esac
+    if [ -d "$RESTORE_DIR" ] && [ -w "$RESTORE_DIR" ] && [ ! -e "$RESTORE_DIR/claude" ]; then
+        ln -sf "$REAL_CLAUDE_TARGET" "$RESTORE_DIR/claude"
+        echo "    Restored $RESTORE_DIR/claude -> $REAL_CLAUDE_TARGET"
+    fi
+else
+    echo "    ⚠️  Could not determine the original claude CLI path; nothing restored."
+    echo "       Reinstall Claude Code (e.g. 'brew reinstall --cask claude-code') if 'claude' now points nowhere."
 fi
 
 # 6. Remove installed files and configs

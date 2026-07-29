@@ -155,60 +155,40 @@ cp "$INSTALL_DIR/bin/ClaudeGuardMenuBar" "$APP_BUNDLE/Contents/MacOS/ClaudeGuard
 mkdir -p "$HOME/Applications"
 ln -sf "$APP_BUNDLE" "$HOME/Applications/ClaudeGuard.app"
 
-# --- 4. Locate the real `claude` CLI so the wrapper can hand off to it -------
-REAL_CLAUDE=""
-for candidate in "/opt/homebrew/bin/claude" "/usr/local/bin/claude" "$HOME/.local/bin/claude"; do
-    if [ -L "$candidate" ]; then
-        resolved=$(readlink -f "$candidate" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$candidate")
-        case "$resolved" in
-            "$INSTALL_DIR"/*|"$SOURCE_DIR"/*) ;;                 # our own wrapper, skip
-            *) [ -f "$resolved" ] && { REAL_CLAUDE="$resolved"; break; } ;;
-        esac
-    fi
-done
-if [ -z "$REAL_CLAUDE" ]; then
-    REAL_CLAUDE=$(find /opt/homebrew/Caskroom/claude-code -maxdepth 2 -name claude -type f 2>/dev/null | sort -V | tail -1)
-fi
-if [ -z "$REAL_CLAUDE" ] || [ ! -f "$REAL_CLAUDE" ]; then
-    FOUND_ON_PATH=$(command -v claude || true)
-    if [ -n "$FOUND_ON_PATH" ]; then
-        RESOLVED_PATH=$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$FOUND_ON_PATH")
-        case "$RESOLVED_PATH" in
-            "$INSTALL_DIR"/*|"$SOURCE_DIR"/*) ;;
-            *) REAL_CLAUDE="$RESOLVED_PATH" ;;
-        esac
-    fi
-fi
-if [ -z "$REAL_CLAUDE" ] || [ ! -f "$REAL_CLAUDE" ]; then
-    warn "Could not find the real 'claude' CLI. If you use Claude Code, run later:"
-    warn "    claudeguard set-cli-path /path/to/real/claude"
-    REAL_CLAUDE="/opt/homebrew/bin/claude"
-else
-    ok "Real Claude CLI: $REAL_CLAUDE"
-fi
-
-mkdir -p "$HOME/.config/claudeguard"
-python3 -c "
-import json, os
-path = os.path.expanduser('~/.config/claudeguard/config.json')
-data = {}
-if os.path.exists(path):
-    try:
-        with open(path) as f: data = json.load(f)
-    except Exception: pass
-data['real_claude_cli_path'] = '$REAL_CLAUDE'
-with open(path, 'w') as f: json.dump(data, f, indent=2)
-"
-
-# --- 5. Symlink the CLIs (manager + `claude` interceptor) -------------------
-info "Installing the 'claudeguard' manager + 'claude' interceptor…"
-mkdir -p "$HOME/.local/bin"
+# --- 4. Symlink the manager CLI ---------------------------------------------
+info "Installing the 'claudeguard' manager…"
+mkdir -p "$HOME/.local/bin" "$CONFIG_DIR"
 ln -sf "$INSTALL_DIR/bin/claudeguard" "$HOME/.local/bin/claudeguard"
 [ -w "/usr/local/bin" ] && ln -sf "$INSTALL_DIR/bin/claudeguard" "/usr/local/bin/claudeguard"
 
-ln -sf "$INSTALL_DIR/src/cli_wrapper.py" "$HOME/.local/bin/claude"
-[ -w "/opt/homebrew/bin" ] && ln -sf "$INSTALL_DIR/src/cli_wrapper.py" "/opt/homebrew/bin/claude"
-[ -w "/usr/local/bin" ]    && ln -sf "$INSTALL_DIR/src/cli_wrapper.py" "/usr/local/bin/claude"
+# --- 5. Hook the `claude` CLI + locate Claude Desktop ------------------------
+# Delegated to src/integrity.py, the same code the daemon runs on a timer, so a
+# fresh install and a later self-heal can't disagree about where Claude lives.
+info "Hooking the 'claude' command…"
+REPAIR_OUT="$(cd "$INSTALL_DIR" && python3 -c "
+import sys
+sys.path.insert(0, '.')
+from src.config import ConfigManager
+from src.integrity import repair
+
+report = repair(ConfigManager())
+print('REAL_CLI=' + (report['real_cli'] or ''))
+for change in report['changed']:
+    print('CHANGED=' + change)
+for note in report['notes']:
+    print('NOTE=' + note)
+" 2>&1)" || REPAIR_OUT=""
+
+REAL_CLAUDE="$(printf '%s\n' "$REPAIR_OUT" | sed -n 's/^REAL_CLI=//p')"
+printf '%s\n' "$REPAIR_OUT" | sed -n 's/^CHANGED=//p' | while IFS= read -r line; do ok "$line"; done
+printf '%s\n' "$REPAIR_OUT" | sed -n 's/^NOTE=//p'    | while IFS= read -r line; do warn "$line"; done
+
+if [ -n "$REAL_CLAUDE" ]; then
+    ok "Real Claude CLI: $REAL_CLAUDE"
+else
+    warn "Could not find the real 'claude' CLI. If you use Claude Code, run later:"
+    warn "    claudeguard set-cli-path /path/to/real/claude"
+fi
 
 # --- 6. LaunchAgent (autostart at login) ------------------------------------
 info "Registering login-autostart LaunchAgent…"

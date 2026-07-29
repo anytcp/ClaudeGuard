@@ -1,13 +1,15 @@
 """
-Единый мозг: единственное место, решающее «можно ли сейчас запускать Claude».
+The brain: the one place that decides "may Claude run right now".
 
-Verdict: "allowed" (защита off или IP в whitelist) / "blocked" (онлайн, IP не в
-whitelist) / "offline" (IP не проверить). Fail closed — пускаем только "allowed".
+Verdict: "allowed" (protection off, or IP whitelisted) / "blocked" (online, IP
+not whitelisted) / "offline" (IP can't be verified). Fail closed — only a
+confirmed "allowed" gets through.
 
-Источник истины — демон (main.swift), публикующий вердикт в state.json на каждой
-проверке. Все потребители (обёртка claude, лаунчер, CLI) читают его, поэтому
-компоненты не расходятся. Если демон лёг (файл отсутствует/протух), мозг сам
-делает STUN-first проверку, чтобы защита не отвалилась молча.
+The source of truth is the daemon (main.swift), which publishes its verdict to
+state.json on every check. Every consumer (the claude wrapper, the launcher, the
+CLI) reads that same file, so the components can never disagree. If the daemon is
+down (file missing or stale) the brain runs its own STUN-first check, so
+protection never drops out silently.
 """
 import json
 import os
@@ -16,12 +18,12 @@ import time
 from src.ip_checker import perform_ip_check
 
 STATE_PATH = os.path.expanduser("~/.config/claudeguard/state.json")
-# Демон переписывает state.json минимум раз в 3с; 7с терпит один пропущенный тик.
+# The daemon rewrites state.json at least every 3s; 7s tolerates one missed tick.
 STATE_MAX_AGE_SECONDS = 7.0
 
 
 def read_daemon_state(max_age=STATE_MAX_AGE_SECONDS):
-    """Свежий словарь состояния демона, или None если файла нет/протух."""
+    """The daemon's state dict while it's fresh, or None if missing/stale."""
     try:
         with open(STATE_PATH) as f:
             d = json.load(f)
@@ -33,18 +35,18 @@ def read_daemon_state(max_age=STATE_MAX_AGE_SECONDS):
 
 
 def daemon_is_up():
-    """True, если демон запущен и публикует свежее состояние."""
+    """True if the daemon is running and publishing fresh state."""
     return read_daemon_state() is not None
 
 
 def get_verdict(config, timeout=2.0, allow_fallback=True):
     """
-    Возвращает (verdict, ip, err), verdict ∈ "allowed"/"blocked"/"offline".
+    Returns (verdict, ip, err), verdict ∈ "allowed"/"blocked"/"offline".
 
-    Порядок: защита off → allowed; вердикт демона (мгновенно); иначе, если
-    allow_fallback — своя STUN-first проверка. allow_fallback=False отдаёт
-    "offline" когда демон лёг (для тесной петли, которой лучше пропустить тик,
-    чем висеть на сети).
+    Order: protection off → allowed; the daemon's verdict (instant); else, when
+    allow_fallback, our own STUN-first check. allow_fallback=False returns
+    "offline" while the daemon is down — for tight loops that would rather skip a
+    tick than block on the network.
     """
     if not config.protection_enabled:
         return "allowed", None, None
@@ -52,7 +54,7 @@ def get_verdict(config, timeout=2.0, allow_fallback=True):
     st = read_daemon_state()
     if st is not None:
         v = st.get("state", "offline")
-        if v == "disabled":  # у демона свой словарь; нормализуем к нашему
+        if v == "disabled":  # the daemon has its own vocabulary; normalise it
             return "allowed", st.get("ip"), None
         return v, st.get("ip"), None
 
@@ -66,8 +68,8 @@ def get_verdict(config, timeout=2.0, allow_fallback=True):
 
 
 def resolve_display_ip(config, timeout=2.0):
-    """Текущий публичный IP только для показа (не для решения). Предпочитает
-    последний IP демона, иначе живой STUN-first запрос. IP-строка или None."""
+    """The current public IP for display only, never for a decision. Prefers the
+    daemon's last known IP, else a live STUN-first lookup. IP string or None."""
     st = read_daemon_state()
     if st is not None:
         ip = st.get("ip")
