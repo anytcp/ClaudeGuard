@@ -34,6 +34,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var currentIP: String = "…"
     var protectionEnabled: Bool = true
     var blockAutoUpdates: Bool = true
+    var modelOverrideEnabled: Bool = false
+    var defaultModel: String = "claude-opus-4-8"
     var allowedIPs: [String] = []
 
     var dynamicStore: SCDynamicStore?
@@ -596,6 +598,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let ips = json["allowed_ips"] as? [String] { allowedIPs = ips }
         if let p = json["protection_enabled"] as? Bool { protectionEnabled = p }
         if let u = json["block_auto_updates"] as? Bool { blockAutoUpdates = u }
+        if let m = json["model_override_enabled"] as? Bool { modelOverrideEnabled = m }
+        if let d = json["default_model"] as? String { defaultModel = d }
     }
 
     func saveConfig() {
@@ -605,6 +609,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         json["allowed_ips"] = allowedIPs
         json["protection_enabled"] = protectionEnabled
         json["block_auto_updates"] = blockAutoUpdates
+        json["model_override_enabled"] = modelOverrideEnabled
+        json["default_model"] = defaultModel
         if let data = try? JSONSerialization.data(withJSONObject: json, options: .prettyPrinted) {
             try? data.write(to: URL(fileURLWithPath: configPath))
         }
@@ -706,6 +712,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let modelToggle = NSMenuItem(title: modelOverrideEnabled ? "✓ Default Model: \(defaultModel)" : "Default Model Override (off)", action: #selector(onToggleModelOverride), keyEquivalent: "")
+        modelToggle.target = self
+        menu.addItem(modelToggle)
+
+        if modelOverrideEnabled {
+            let changeModel = NSMenuItem(title: "    Change Model…", action: #selector(onChangeModel), keyEquivalent: "")
+            changeModel.target = self
+            menu.addItem(changeModel)
+        }
+
+        menu.addItem(.separator())
+
         if !currentIP.isEmpty, currentIP != "No Internet", currentIP != "…", !allowedIPs.contains(currentIP) {
             let add = NSMenuItem(title: "➕ Whitelist Current IP (\(currentIP))", action: #selector(onAddCurrentIP), keyEquivalent: "")
             add.target = self
@@ -742,6 +760,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         saveConfig()
         rebuildMenu()        // reflect the toggle instantly; enforcement follows
         recheckAsync()
+    }
+
+    @objc func onToggleModelOverride() {
+        modelOverrideEnabled.toggle()
+        saveConfig()
+        rebuildMenu()
+    }
+
+    @objc func onChangeModel() {
+        let script = "display dialog \"Enter Claude model ID (e.g. claude-opus-4-8):\" default answer \"\(defaultModel)\" with title \"ClaudeGuard Default Model\""
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try? process.run()
+        process.waitUntilExit()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        if let out = String(data: data, encoding: .utf8), out.contains("text returned:") {
+            let parts = out.components(separatedBy: "text returned:")
+            if parts.count > 1 {
+                let raw = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !raw.isEmpty {
+                    defaultModel = raw
+                    saveConfig()
+                    rebuildMenu()
+                }
+            }
+        }
     }
 
     @objc func onAddCurrentIP() {

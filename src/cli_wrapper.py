@@ -153,7 +153,10 @@ def run_real_claude(config):
         env["DISABLE_AUTO_UPDATE"] = "1"
         env["CLAUDE_DISABLE_AUTO_UPDATE"] = "1"
 
-    args = [real_path] + sys.argv[1:]
+    if config.model_override_enabled and config.default_model and "--model" not in sys.argv:
+        args = [real_path, "--model", config.default_model] + sys.argv[1:]
+    else:
+        args = [real_path] + sys.argv[1:]
 
     stop_event = threading.Event()
     block_info = {"blocked": False, "ip": None, "err": None}

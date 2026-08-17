@@ -9,6 +9,8 @@ DEFAULT_CONFIG = {
     "allowed_ips": [],
     "protection_enabled": True,
     "block_auto_updates": True,
+    "model_override_enabled": False,
+    "default_model": "claude-opus-4-8",
     "check_interval": 10,
     "blocked_domains": [
         "claude.com",
@@ -110,6 +112,24 @@ class ConfigManager:
     @property
     def check_interval(self):
         return self.config.get("check_interval", 10)
+
+    @property
+    def model_override_enabled(self):
+        return self.config.get("model_override_enabled", False)
+
+    @model_override_enabled.setter
+    def model_override_enabled(self, val):
+        self.config["model_override_enabled"] = bool(val)
+        self.save_config()
+
+    @property
+    def default_model(self):
+        return self.config.get("default_model", "claude-opus-4-8")
+
+    @default_model.setter
+    def default_model(self, val):
+        self.config["default_model"] = str(val).strip()
+        self.save_config()
 
     @property
     def real_claude_cli(self):
