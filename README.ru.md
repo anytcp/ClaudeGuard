@@ -25,6 +25,7 @@ ClaudeGuard решает эту проблему: каждый запуск и �
 - 🚀 **Автозапуск при входе** через `LaunchAgent`.
 - 🟢 **Меню-бар** - живой статус (🟢 защищено / 🔴 блок / ⚪ офлайн / 🟡 выкл), тумблеры, whitelist в один клик.
 - ❄️ **Заморозка автообновлений** - блокирует серверы обновлений и локает директории обновлений.
+- 🤖 **Модель по умолчанию** - закрепите модель для каждой сессии `claude` (например `claude-opus-4-8`) прямо из меню-бара; обёртка CLI автоматически подставляет `--model`, чтобы не вводить каждый раз руками.
 
 ## Установка
 
@@ -69,6 +70,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/ivblz/ClaudeGuard/main/i
 | `claudeguard list-ips` | Показать whitelist |
 | `claudeguard enable-protection` / `disable-protection` | Включить / выключить защиту |
 | `claudeguard block-updates` / `allow-updates` | Заблокировать / разрешить автообновления |
+| `claudeguard set-model <model>` | Задать модель по умолчанию (например `claude-opus-4-8`) |
+| `claudeguard enable-model` / `disable-model` | Включить / выключить подмену модели |
 | `claudeguard launch-desktop` | Запустить Claude Desktop с pre-flight проверкой |
 | `claudeguard start` / `stop` | Запустить / остановить меню-бар демон |
 | `claudeguard doctor` | Проверить, что все перехваты на месте, и переустановить их |

@@ -31,6 +31,9 @@ Commands:
   disable-protection   Disable protection (Traffic unblocked)
   block-updates        Enable auto-update locking (Desktop & CLI)
   allow-updates        Disable auto-update locking
+  set-model <model>    Set the default model (e.g. claude-opus-4-8)
+  enable-model         Enable model override for every claude session
+  disable-model        Disable model override
   launch-desktop       Launch Claude Desktop with pre-flight IP verification
   start                Start ClaudeGuard Menu Bar App
   stop                 Stop ClaudeGuard Menu Bar App
@@ -53,6 +56,10 @@ def main():
         print("=== ClaudeGuard Status ===")
         print(f"Protection Enabled : {config.protection_enabled}")
         print(f"Block Auto-Updates : {config.block_auto_updates}")
+        if config.model_override_enabled:
+            print(f"Default Model      : {config.default_model}")
+        else:
+            print(f"Default Model      : off")
         print(f"Whitelisted IPs    : {', '.join(config.allowed_ips) if config.allowed_ips else 'NONE (Access Blocked)'}")
 
         # Same verdict the wrapper and launcher enforce; show its source.
@@ -120,6 +127,24 @@ def main():
         config.block_auto_updates = False
         apply_auto_update_lock(False)
         print("🟢 Auto-updates ALLOWED.")
+
+    elif cmd == "set-model":
+        if len(sys.argv) < 3:
+            print("Error: Specify model ID. Example: claudeguard set-model claude-opus-4-8")
+            sys.exit(1)
+        model = sys.argv[2].strip()
+        config.default_model = model
+        if not config.model_override_enabled:
+            config.model_override_enabled = True
+        print(f"✅ Default model set to '{model}' (override enabled).")
+
+    elif cmd == "enable-model":
+        config.model_override_enabled = True
+        print(f"✅ Model override ENABLED. Model: {config.default_model}")
+
+    elif cmd == "disable-model":
+        config.model_override_enabled = False
+        print("🟡 Model override DISABLED.")
 
     elif cmd == "launch-desktop":
         launcher = os.path.join(PROJECT_DIR, "src", "app_launcher.py")

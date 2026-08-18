@@ -25,6 +25,7 @@ ClaudeGuard solves that: every launch and every running session is checked again
 - 🚀 **Autostart at login** via `LaunchAgent`.
 - 🟢 **Menu bar UI** - live status (🟢 protected / 🔴 blocked / ⚪ offline / 🟡 off), toggles, one-click whitelist.
 - ❄️ **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
+- 🤖 **Default model override** - pin a model for every `claude` session (e.g. `claude-opus-4-8`) from the menu bar; the CLI wrapper injects `--model` automatically so you don't have to type it each time.
 
 ## Install
 
@@ -69,6 +70,8 @@ After install the `claudeguard` command is available:
 | `claudeguard list-ips` | List whitelisted IPs |
 | `claudeguard enable-protection` / `disable-protection` | Turn protection on / off |
 | `claudeguard block-updates` / `allow-updates` | Lock / unlock auto-updates |
+| `claudeguard set-model <model>` | Set the default model (e.g. `claude-opus-4-8`) |
+| `claudeguard enable-model` / `disable-model` | Turn the model override on / off |
 | `claudeguard launch-desktop` | Launch Claude Desktop with a pre-flight check |
 | `claudeguard start` / `stop` | Start / stop the menu bar daemon |
 | `claudeguard doctor` | Check every hook is still attached, and re-attach it |
