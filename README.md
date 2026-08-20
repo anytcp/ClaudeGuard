@@ -1,6 +1,6 @@
 <div align="center">
 
-# ClaudeGuard
+# 🛡️ ClaudeGuard
 
 **A VPN-whitelist guard for Claude on Linux.**
 
@@ -19,14 +19,14 @@ ClaudeGuard solves that: every launch and every running session is checked again
 
 ## Features
 
-- **IP whitelist** - Claude opens **only** when your public IP matches one of your VPN nodes.
-- **Instant pre-flight check** - launching `claude` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted = blocked before anything connects.
-- **One brain, one verdict** - a background daemon publishes the decision to a state file; the CLI and the app launcher read the same verdict, so nothing can disagree.
-- **Autostart at login** via systemd user service.
-- **Two daemon modes** - headless (systemd, for servers) or system tray icon (for desktops with X11/Wayland via pystray).
-- **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
-- **Default model override** - pin a model for every `claude` session (e.g. `claude-opus-4-8`); the CLI wrapper injects `--model` automatically.
-- **Claude Desktop guard** - detects and kills Electron-based Claude Desktop when blocked.
+- 🔐 **IP whitelist** - Claude opens **only** when your public IP matches one of your VPN nodes.
+- ⏱ **Instant pre-flight check** - launching `claude` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted → blocked before anything connects.
+- 🧠 **One brain, one verdict** - a background daemon publishes the decision to a state file; the CLI and the app launcher read the same verdict, so nothing can disagree.
+- 🚀 **Autostart at login** via systemd user service.
+- 🟢 **Two daemon modes** - headless (systemd, for servers) or system tray icon (🟢 protected / 🔴 blocked / ⚪ offline / 🟡 off) for desktops with X11/Wayland via pystray.
+- ❄️ **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
+- 🤖 **Default model override** - pin a model for every `claude` session (e.g. `claude-opus-4-8`); the CLI wrapper injects `--model` automatically.
+- 🚫 **Claude Desktop guard** - detects and kills Electron-based Claude Desktop when blocked.
 
 ## Install
 
