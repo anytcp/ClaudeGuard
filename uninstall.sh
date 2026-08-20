@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-PLIST_PATH="$HOME/Library/LaunchAgents/com.claudeguard.daemon.plist"
-SUDOERS_FILE="/etc/sudoers.d/claudeguard"
 INSTALL_DIR="$HOME/.local/share/ClaudeGuard"
 CONFIG_DIR="$HOME/.config/claudeguard"
-# Real claude path recorded at install time (avoids hardcoding a version).
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+HELPER_SYS_DIR="/var/lib/claudeguard"
+
 REAL_CLAUDE_TARGET=$(python3 -c "
 import json, os
 path = os.path.expanduser('~/.config/claudeguard/config.json')
@@ -13,37 +14,42 @@ try:
         print(json.load(f).get('real_claude_cli_path', ''))
 except Exception:
     print('')
-" 2>/dev/null)
+" 2>/dev/null || true)
 
 echo "=================================================="
-echo " 🛑 Uninstalling ClaudeGuard (Clean Reset)"
+echo "  Uninstalling ClaudeGuard (Clean Reset)"
 echo "=================================================="
 
-# 1. Unload and delete LaunchAgent
-echo "--> Unloading LaunchAgent..."
-if [ -f "$PLIST_PATH" ]; then
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    rm -f "$PLIST_PATH"
-    echo "    Removed LaunchAgent: $PLIST_PATH"
-fi
+# 1. Stop and disable systemd user service
+echo "--> Stopping systemd user service..."
+systemctl --user stop claudeguard.service 2>/dev/null || true
+systemctl --user disable claudeguard.service 2>/dev/null || true
+rm -f "$SYSTEMD_USER_DIR/claudeguard.service"
+systemctl --user daemon-reload 2>/dev/null || true
 
-# 2. Terminate running background processes
+# 2. Terminate any remaining daemon processes
 echo "--> Stopping running processes..."
-pkill -f "ClaudeGuardMenuBar" 2>/dev/null || true
-pkill -f "ClaudeGuard" 2>/dev/null || true
+pkill -f "daemon.py.*ClaudeGuard" 2>/dev/null || true
 
-# 2b. Remove the root network-helper LaunchDaemon + its binary, and disable pf
-echo "--> Removing root network helper (LaunchDaemon)..."
-HELPER_PLIST="/Library/LaunchDaemons/com.claudeguard.helper.plist"
-HELPER_SYS_DIR="/Library/Application Support/ClaudeGuard"
-sudo launchctl bootout system "$HELPER_PLIST" 2>/dev/null || sudo launchctl unload "$HELPER_PLIST" 2>/dev/null || true
-sudo rm -f "$HELPER_PLIST" 2>/dev/null || true
+# 3. Remove the root network-helper (systemd path + service), clear iptables
+echo "--> Removing root network helper..."
+sudo systemctl stop claudeguard-helper.path 2>/dev/null || true
+sudo systemctl disable claudeguard-helper.path 2>/dev/null || true
+sudo rm -f /etc/systemd/system/claudeguard-helper.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/claudeguard-helper.path 2>/dev/null || true
+sudo systemctl daemon-reload 2>/dev/null || true
 sudo rm -rf "$HELPER_SYS_DIR" 2>/dev/null || true
-sudo /sbin/pfctl -d 2>/dev/null || true
-sudo /sbin/pfctl -F states 2>/dev/null || true
 
-# 3. Restore /etc/hosts file
-echo "--> Restoring /etc/hosts and DNS settings..."
+# Clear iptables rules
+echo "--> Clearing iptables rules..."
+for prog in iptables ip6tables; do
+    sudo $prog -D OUTPUT -j CLAUDEGUARD 2>/dev/null || true
+    sudo $prog -F CLAUDEGUARD 2>/dev/null || true
+    sudo $prog -X CLAUDEGUARD 2>/dev/null || true
+done
+
+# 4. Restore /etc/hosts file
+echo "--> Restoring /etc/hosts..."
 python3 -c "
 import os, subprocess
 HOSTS_PATH = '/etc/hosts'
@@ -60,23 +66,26 @@ if os.path.exists(HOSTS_PATH):
                 content = content[:start] + content[end:]
         tmp = '/tmp/claudeguard_clean_hosts.tmp'
         with open(tmp, 'w') as f: f.write(content)
-        cmd = f'sudo cp {tmp} {HOSTS_PATH} && rm -f {tmp}'
-        subprocess.run(cmd, shell=True, capture_output=True)
+        subprocess.run(['sudo', 'cp', tmp, HOSTS_PATH], check=False)
+        os.remove(tmp)
     except: pass
 " 2>/dev/null || true
 
 # Flush DNS
-dscacheutil -flushcache 2>/dev/null || true
-sudo killall -HUP mDNSResponder 2>/dev/null || true
+echo "--> Flushing DNS cache..."
+resolvectl flush-caches 2>/dev/null \
+    || systemd-resolve --flush-caches 2>/dev/null \
+    || systemctl restart nscd 2>/dev/null \
+    || true
 
-# 4. Unlock auto-update folders
-# Globbed: a stale literal bundle id silently unlocks nothing and would leave the
-# update dirs frozen forever.
+# 5. Unlock auto-update paths
 echo "--> Unlocking filesystem auto-update locks..."
-for target in "$HOME/Library/Caches/"com.anthropic.claude*.ShipIt \
-              "$HOME/Library/Application Support/Claude/app-update.yml"; do
+for target in "$HOME/.config/claude-desktop/app-update.yml" \
+              "$HOME/.config/Claude/app-update.yml" \
+              "$HOME/.cache/claude-desktop" \
+              "$HOME/.cache/Claude"; do
     [ -e "$target" ] || continue
-    chflags -R nouchg "$target" 2>/dev/null || true
+    sudo chattr -R -i "$target" 2>/dev/null || true
     if [ -d "$target" ]; then
         chmod -R 755 "$target" 2>/dev/null || true
     else
@@ -84,44 +93,35 @@ for target in "$HOME/Library/Caches/"com.anthropic.claude*.ShipIt \
     fi
 done
 
-# 5. Un-hook 'claude' and restore the real binary
+# 6. Un-hook 'claude' and restore the real binary
 echo "--> Restoring original 'claude' CLI binary..."
 rm -f "$HOME/.local/bin/claudeguard"
-rm -f "/usr/local/bin/claudeguard" 2>/dev/null || true
+sudo rm -f "/usr/local/bin/claudeguard" 2>/dev/null || true
 
-# Only shims that are actually ours: a blanket rm would delete a real install
-# sitting at the same path (the native installer owns ~/.local/bin/claude).
-for link in "$HOME/.local/bin/claude" "/usr/local/bin/claude" "/opt/homebrew/bin/claude"; do
+for link in "$HOME/.local/bin/claude" "/usr/local/bin/claude"; do
     [ -L "$link" ] || continue
     case "$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$link" 2>/dev/null)" in
         *cli_wrapper.py) rm -f "$link" && echo "    Removed ClaudeGuard shim: $link" ;;
     esac
 done
 
-# Put the real binary back where its own installer would have put it.
 if [ -n "$REAL_CLAUDE_TARGET" ] && [ -f "$REAL_CLAUDE_TARGET" ]; then
-    case "$REAL_CLAUDE_TARGET" in
-        /opt/homebrew/*) RESTORE_DIR="/opt/homebrew/bin" ;;
-        /usr/local/*)    RESTORE_DIR="/usr/local/bin" ;;
-        *)               RESTORE_DIR="$HOME/.local/bin" ;;
-    esac
+    RESTORE_DIR="$HOME/.local/bin"
     if [ -d "$RESTORE_DIR" ] && [ -w "$RESTORE_DIR" ] && [ ! -e "$RESTORE_DIR/claude" ]; then
         ln -sf "$REAL_CLAUDE_TARGET" "$RESTORE_DIR/claude"
         echo "    Restored $RESTORE_DIR/claude -> $REAL_CLAUDE_TARGET"
     fi
 else
-    echo "    ⚠️  Could not determine the original claude CLI path; nothing restored."
-    echo "       Reinstall Claude Code (e.g. 'brew reinstall --cask claude-code') if 'claude' now points nowhere."
+    echo "    Could not determine the original claude CLI path; nothing restored."
 fi
 
-# 6. Remove installed files and configs
+# 7. Remove installed files and configs
 echo "--> Cleaning configuration and installation files..."
 rm -rf "$INSTALL_DIR"
 rm -rf "$CONFIG_DIR"
-sudo rm -f "$SUDOERS_FILE" 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo " ✨ ClaudeGuard completely uninstalled!"
-echo " System restored to clean state."
+echo "  ClaudeGuard completely uninstalled!"
+echo "  System restored to clean state."
 echo "=================================================="

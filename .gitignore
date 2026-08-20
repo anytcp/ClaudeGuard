@@ -1,6 +1,11 @@
 # Python
 __pycache__/
 *.pyc
+*.pyo
 
-# macOS
+# Build artifacts
+hosts-helper
+*.o
+
+# macOS leftovers
 .DS_Store

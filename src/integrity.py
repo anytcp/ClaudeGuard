@@ -2,8 +2,8 @@
 
 Every hook we own points at something Anthropic's installers rewrite under us:
 the `claude` shim (a reinstall drops the real binary back on top of it), the
-version-stamped path we hand off to, and Claude Desktop's bundle id. Pinning any
-of them means the guard silently detaches while the menu bar still says 🟢 — so
+version-stamped path we hand off to, and Claude Desktop's Electron binary. Pinning any
+of them means the guard silently detaches while the daemon still says allowed — so
 everything here is discovered, and `repair()` re-attaches what came loose.
 """
 import glob
@@ -14,14 +14,8 @@ import subprocess
 HOME = os.path.expanduser("~")
 INSTALL_DIR = os.path.join(HOME, ".local", "share", "ClaudeGuard")
 
-# We create the shim in PRIMARY unconditionally; in the others we only replace a
-# `claude` that already existed, never invent one where there was none.
 PRIMARY_LINK_DIR = os.path.join(HOME, ".local", "bin")
-CLI_LINK_DIRS = [PRIMARY_LINK_DIR, "/opt/homebrew/bin", "/usr/local/bin"]
-
-# Match on the shared prefix — the exact id has already changed once.
-DESKTOP_BUNDLE_PREFIX = "com.anthropic.claude"
-DESKTOP_BUNDLE_IDS = ["com.anthropic.claudefordesktop", "com.anthropic.claudefor-mac"]
+CLI_LINK_DIRS = [PRIMARY_LINK_DIR, "/usr/local/bin"]
 
 
 # --- our own wrapper --------------------------------------------------------
@@ -35,11 +29,7 @@ def wrapper_path():
 
 
 def is_our_wrapper(path):
-    """True if `path` is a ClaudeGuard shim rather than a real Claude binary.
-
-    Never hand off to ourselves: a wrapper pointing at a wrapper is a fork bomb,
-    which is what a naive "first `claude` on PATH" fallback produces once our
-    shim is installed."""
+    """True if `path` is a ClaudeGuard shim rather than a real Claude binary."""
     if not path:
         return False
     try:
@@ -49,7 +39,6 @@ def is_our_wrapper(path):
     if os.path.basename(real) == "cli_wrapper.py":
         return True
     try:
-        # The size guard means we never read the real CLI (a ~200 MB binary).
         if os.path.isfile(real) and os.path.getsize(real) < 200_000:
             with open(real, "rb") as f:
                 if b"ClaudeGuard" in f.read(4096):
@@ -65,23 +54,18 @@ def _version_key(text):
     return tuple(int(n) for n in re.findall(r"\d+", text)) or (0,)
 
 
-def _cask_binaries():
-    """Homebrew casks, newest first. This is what still finds the real binary
-    after we've taken over /opt/homebrew/bin/claude."""
-    found = []
-    for root in ("/opt/homebrew/Caskroom/claude-code", "/usr/local/Caskroom/claude-code"):
-        found.extend(glob.glob(os.path.join(root, "*", "claude")))
-    return sorted(found, key=lambda p: _version_key(os.path.basename(os.path.dirname(p))),
-                  reverse=True)
-
-
 def _native_binaries():
+    """Claude Code native install paths on Linux (incl. NixOS)."""
     patterns = [
         os.path.join(HOME, ".local", "share", "claude", "versions", "*", "claude"),
         os.path.join(HOME, ".local", "share", "claude", "*", "claude"),
         os.path.join(HOME, ".local", "share", "claude", "claude"),
         os.path.join(HOME, ".claude", "local", "claude"),
         os.path.join(HOME, ".claude", "local", "node_modules", ".bin", "claude"),
+        # NixOS
+        os.path.join(HOME, ".nix-profile", "bin", "claude"),
+        "/nix/store/*/bin/claude",
+        "/run/current-system/sw/bin/claude",
     ]
     found = []
     for pattern in patterns:
@@ -92,7 +76,16 @@ def _native_binaries():
 def _path_binaries():
     dirs = list(CLI_LINK_DIRS)
     dirs += [d for d in os.environ.get("PATH", "").split(":") if d]
-    dirs += [os.path.join(HOME, ".bun", "bin"), os.path.join(HOME, ".volta", "bin"), "/usr/bin"]
+    dirs += [
+        os.path.join(HOME, ".bun", "bin"),
+        os.path.join(HOME, ".volta", "bin"),
+        os.path.join(HOME, ".npm-global", "bin"),
+        os.path.join(HOME, ".nvm", "versions", "node"),
+        os.path.join(HOME, ".nix-profile", "bin"),
+        "/run/current-system/sw/bin",
+        "/usr/bin",
+        "/snap/bin",
+    ]
     seen, found = set(), []
     for d in dirs:
         if not d or d in seen:
@@ -117,15 +110,11 @@ def _usable_real_cli(path):
 
 
 def discover_real_cli(config=None):
-    """The real `claude` binary, or None.
-
-    The configured path wins while it resolves, so an explicit `set-cli-path`
-    sticks and the hand-off target doesn't jitter between installs; the rest is
-    the recovery order for when an upgrade has deleted it."""
+    """The real `claude` binary, or None."""
     candidates = []
     if config is not None:
         candidates.append(config.config.get("real_claude_cli_path"))
-    candidates += _cask_binaries() + _native_binaries() + _path_binaries()
+    candidates += _native_binaries() + _path_binaries()
     for candidate in candidates:
         real = _usable_real_cli(candidate)
         if real:
@@ -133,41 +122,102 @@ def discover_real_cli(config=None):
     return None
 
 
-# --- Claude Desktop discovery ----------------------------------------------
+# --- Claude Desktop discovery (Electron on Linux) --------------------------
 
-def _mdfind(query):
+DESKTOP_PROCESS_PATTERNS = [
+    "claude-desktop",
+    "Claude.*electron",
+    "claude.*Electron",
+]
+
+DESKTOP_SEARCH_PATHS = [
+    "/opt/Claude",
+    "/opt/claude-desktop",
+    "/usr/lib/claude-desktop",
+    "/usr/share/claude-desktop",
+    os.path.join(HOME, ".local", "share", "claude-desktop"),
+    "/snap/claude-desktop/current",
+    "/var/lib/flatpak/app/com.anthropic.claude",
+    os.path.join(HOME, ".local", "share", "flatpak", "app", "com.anthropic.claude"),
+    # NixOS
+    os.path.join(HOME, ".nix-profile", "share", "claude-desktop"),
+    "/run/current-system/sw/share/claude-desktop",
+]
+
+DESKTOP_DESKTOP_FILES = [
+    "/usr/share/applications/claude-desktop.desktop",
+    os.path.join(HOME, ".local", "share", "applications", "claude-desktop.desktop"),
+]
+
+
+def _parse_desktop_file_exec(desktop_file):
+    """Extract Exec= path from a .desktop file."""
     try:
-        res = subprocess.run(["/usr/bin/mdfind", query], capture_output=True, text=True, timeout=5)
+        with open(desktop_file, "r") as f:
+            for line in f:
+                if line.startswith("Exec="):
+                    cmd = line[5:].strip().split()[0]
+                    if os.path.isfile(cmd):
+                        return cmd
     except Exception:
-        return []
-    return [line for line in res.stdout.splitlines() if line.strip().endswith(".app")]
+        pass
+    return None
 
 
 def discover_desktop_app(config=None):
-    """Claude.app, or None. Falls back to Spotlight so a copy kept outside
-    /Applications is still found."""
+    """Claude Desktop (Electron) on Linux, or None."""
     candidates = []
     if config is not None:
-        candidates.append(config.config.get("real_claude_app_path"))
-    candidates += ["/Applications/Claude.app", os.path.join(HOME, "Applications", "Claude.app")]
+        app = config.config.get("real_claude_app_path")
+        if app:
+            candidates.append(app)
+
+    for path in DESKTOP_SEARCH_PATHS:
+        if os.path.isdir(path):
+            candidates.append(path)
+        for name in ("claude-desktop", "Claude", "claude"):
+            full = os.path.join(path, name)
+            if os.path.isfile(full) and os.access(full, os.X_OK):
+                return full
+
+    for df in DESKTOP_DESKTOP_FILES:
+        exe = _parse_desktop_file_exec(df)
+        if exe:
+            return exe
+
     for candidate in candidates:
-        if candidate and os.path.isdir(candidate):
+        if candidate and os.path.exists(candidate):
             return candidate
-    for bundle_id in DESKTOP_BUNDLE_IDS:
-        for hit in _mdfind(f"kMDItemCFBundleIdentifier == '{bundle_id}'"):
-            if os.path.isdir(hit):
-                return hit
-    for hit in _mdfind(f"kMDItemCFBundleIdentifier == '{DESKTOP_BUNDLE_PREFIX}*'"):
-        if os.path.isdir(hit) and os.path.basename(hit) != "ClaudeGuard.app":
-            return hit
+
+    try:
+        result = subprocess.run(["which", "claude-desktop"],
+                                capture_output=True, text=True, timeout=3)
+        if result.returncode == 0:
+            path = result.stdout.strip()
+            if path and os.path.isfile(path):
+                return path
+    except Exception:
+        pass
+
     return None
 
 
 def desktop_update_paths():
-    """Claude Desktop's auto-update state. Globbed, not keyed on a literal bundle
-    id — a stale one matches nothing and turns the freeze into a silent no-op."""
-    paths = glob.glob(os.path.join(HOME, "Library", "Caches", "com.anthropic.claude*.ShipIt"))
-    paths += glob.glob(os.path.join(HOME, "Library", "Application Support", "Claude", "app-update.yml"))
+    """Claude Desktop's auto-update state on Linux."""
+    paths = []
+    for pattern in [
+        os.path.join(HOME, ".config", "claude-desktop", "app-update.yml"),
+        os.path.join(HOME, ".config", "Claude", "app-update.yml"),
+        os.path.join(HOME, ".local", "share", "claude-desktop", "app-update.yml"),
+    ]:
+        if os.path.exists(pattern):
+            paths.append(pattern)
+    for pattern in [
+        os.path.join(HOME, ".cache", "claude-desktop"),
+        os.path.join(HOME, ".cache", "Claude"),
+    ]:
+        matches = glob.glob(pattern + "*/update*")
+        paths.extend(matches)
     return paths
 
 
@@ -179,7 +229,7 @@ def _relink(wrapper, link):
         if os.path.lexists(tmp):
             os.remove(tmp)
         os.symlink(wrapper, tmp)
-        os.replace(tmp, link)   # atomic: `claude` is never briefly missing
+        os.replace(tmp, link)
         return True
     except OSError:
         try:
@@ -191,11 +241,7 @@ def _relink(wrapper, link):
 
 
 def repair_cli(config, relink=True):
-    """Re-point the config at a real `claude`, then re-hook the shims.
-
-    Order is the whole trick: a reinstall leaves the real binary at exactly the
-    path we want to claim, so claiming it before discovering it would erase our
-    only handle on it and break `claude` for good."""
+    """Re-point the config at a real `claude`, then re-hook the shims."""
     report = {"real_cli": None, "changed": [], "notes": []}
 
     real = discover_real_cli(config)
@@ -233,14 +279,10 @@ def repair_cli(config, relink=True):
             continue
 
         if exists and not real:
-            # Taking the name over now would leave no working `claude` at all;
-            # leaving it alone merely leaves it unguarded.
             report["notes"].append(f"{link} left in place (real CLI unknown)")
             continue
 
         if exists and not os.path.islink(link) and not is_our_wrapper(link):
-            # A real binary copied in, not a symlink — replacing it would destroy
-            # the install.
             report["notes"].append(f"{link} is a real binary, not a symlink — not replaced")
             continue
 
@@ -269,8 +311,7 @@ def repair_desktop(config):
 
 
 def repair(config):
-    """Full self-heal. Cheap enough to run on a timer — a handful of stat calls
-    unless something is actually broken."""
+    """Full self-heal."""
     cli = repair_cli(config)
     desktop = repair_desktop(config)
     return {
@@ -282,8 +323,7 @@ def repair(config):
 
 
 def cli_hook_status():
-    """(intercepted, details) for `claudeguard doctor` — what a `claude` typed in
-    a shell would actually reach."""
+    """(intercepted, details) for `claudeguard doctor`."""
     details = []
     intercepted = True
     path_dirs = [d for d in os.environ.get("PATH", "").split(":") if d]

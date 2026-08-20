@@ -5,7 +5,7 @@ Verdict: "allowed" (protection off, or IP whitelisted) / "blocked" (online, IP
 not whitelisted) / "offline" (IP can't be verified). Fail closed — only a
 confirmed "allowed" gets through.
 
-The source of truth is the daemon (main.swift), which publishes its verdict to
+The source of truth is the daemon (daemon.py), which publishes its verdict to
 state.json on every check. Every consumer (the claude wrapper, the launcher, the
 CLI) reads that same file, so the components can never disagree. If the daemon is
 down (file missing or stale) the brain runs its own STUN-first check, so

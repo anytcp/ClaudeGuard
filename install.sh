@@ -1,33 +1,22 @@
 #!/usr/bin/env bash
 #
-# ClaudeGuard installer.
+# ClaudeGuard installer for Linux (Arch / Debian / Fedora / etc.)
 #
-# Works two ways from the SAME file:
-#   • One-liner:   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ivblz/ClaudeGuard/main/install.sh)"
-#   • Local:       ./install.sh   (from a git checkout or unpacked archive)
+# Two ways to install — both give the exact same result.
 #
-# When run via curl|bash there's no local source tree, so the script first
-# fetches the repo, then compiles the Swift menu bar app + C helper NATIVELY on
-# this Mac (Apple Silicon or Intel). Locally-compiled binaries carry no
-# quarantine flag, so Gatekeeper never blocks them — no Apple Developer account,
-# no code-signing, no notarization required.
+#   One-liner:  bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOU/ClaudeGuard/main/install.sh)"
+#   Local:      ./install.sh
+#
+# Compiles the C root helper on this machine with gcc/clang. No macOS deps.
 set -euo pipefail
 
-# Which repo the one-liner pulls from. Override without editing:
-#   CLAUDEGUARD_REPO=you/ClaudeGuard bash -c "$(curl -fsSL .../install.sh)"
-REPO="${CLAUDEGUARD_REPO:-ivblz/ClaudeGuard}"
+REPO="${CLAUDEGUARD_REPO:-anytcp/ClaudeGuard}"
 BRANCH="${CLAUDEGUARD_BRANCH:-main}"
 
 INSTALL_DIR="$HOME/.local/share/ClaudeGuard"
-APP_BUNDLE="$INSTALL_DIR/ClaudeGuard.app"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.claudeguard.daemon.plist"
 CONFIG_DIR="$HOME/.config/claudeguard"
-# Root privileged-helper: a LaunchDaemon (no sudoers, no setuid). The binary
-# lives in a root-owned dir so it can't be swapped, and it runs only when the
-# trigger file below is touched.
-HELPER_SYS_DIR="/Library/Application Support/ClaudeGuard"
-HELPER_PLIST="/Library/LaunchDaemons/com.claudeguard.helper.plist"
-LEGACY_SUDOERS="/etc/sudoers.d/claudeguard"   # removed on upgrade from old versions
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+HELPER_SYS_DIR="/var/lib/claudeguard"
 
 # --- Pretty output ----------------------------------------------------------
 if [ -t 1 ]; then
@@ -37,9 +26,9 @@ else
     BOLD=; DIM=; RED=; GRN=; YLW=; CYN=; RST=
 fi
 info() { printf '%s %s\n' "${CYN}==>${RST}" "$*"; }
-ok()   { printf '%s %s\n' "${GRN}✓${RST}"   "$*"; }
-warn() { printf '%s %s\n' "${YLW}⚠${RST}"   "$*"; }
-die()  { printf '%s %s\n' "${RED}✗${RST}"   "$*" >&2; exit 1; }
+ok()   { printf '%s %s\n' "${GRN}+${RST}"   "$*"; }
+warn() { printf '%s %s\n' "${YLW}!${RST}"   "$*"; }
+die()  { printf '%s %s\n' "${RED}x${RST}"   "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 printf '%s\n' "${BOLD}${CYN}"
@@ -50,12 +39,24 @@ cat <<'BANNER'
  | |___| | (_| | |_| | (_| |  __/| |_| | |_| | (_| | | | (_| |
   \____|_|\__,_|\__,_|\__,_|\___| \____|\__,_|\__,_|_|  \__,_|
 BANNER
-printf '%s\n' "        VPN-whitelist guard for Claude on macOS${RST}"
+printf '%s\n' "        VPN-whitelist guard for Claude on Linux${RST}"
 printf '\n'
 
-[ "$(uname -s)" = "Darwin" ] || die "ClaudeGuard is macOS-only."
+[ "$(uname -s)" = "Linux" ] || die "This installer is for Linux only."
 
-# --- Bootstrap: fetch source when piped from curl (no local tree) -----------
+# --- Detect package manager --------------------------------------------------
+detect_pm() {
+    if [ -e /etc/NIXOS ] || have nixos-rebuild; then echo "nix"; return; fi
+    if have pacman;  then echo "pacman";  return; fi
+    if have apt-get; then echo "apt";     return; fi
+    if have dnf;     then echo "dnf";     return; fi
+    if have zypper;  then echo "zypper";  return; fi
+    echo "unknown"
+}
+PM="$(detect_pm)"
+info "Detected package manager: ${BOLD}$PM${RST}"
+
+# --- Bootstrap: fetch source when piped from curl -----------------------------
 _src="${BASH_SOURCE[0]:-}"
 if [ -n "$_src" ] && [ -f "$_src" ]; then
     SOURCE_DIR="$(cd "$(dirname "$_src")" && pwd)"
@@ -63,108 +64,179 @@ else
     SOURCE_DIR=""
 fi
 
-if [ -z "$SOURCE_DIR" ] || [ ! -f "$SOURCE_DIR/src/main.swift" ]; then
-    info "Fetching ClaudeGuard from ${BOLD}github.com/$REPO${RST} (branch $BRANCH)…"
+if [ -z "$SOURCE_DIR" ] || [ ! -f "$SOURCE_DIR/src/daemon.py" ]; then
+    info "Fetching ClaudeGuard from ${BOLD}github.com/$REPO${RST} (branch $BRANCH)..."
     BOOT_TMP="$(mktemp -d)"
     trap 'rm -rf "$BOOT_TMP"' EXIT
     if have git; then
         git clone --depth 1 --branch "$BRANCH" "https://github.com/$REPO.git" \
-            "$BOOT_TMP/ClaudeGuard" >/dev/null 2>&1 || die "git clone failed (is $REPO correct and public?)"
+            "$BOOT_TMP/ClaudeGuard" >/dev/null 2>&1 || die "git clone failed"
         SOURCE_DIR="$BOOT_TMP/ClaudeGuard"
     else
         curl -fsSL "https://codeload.github.com/$REPO/tar.gz/refs/heads/$BRANCH" \
-            | tar -xz -C "$BOOT_TMP" || die "download failed (is $REPO correct and public?)"
+            | tar -xz -C "$BOOT_TMP" || die "download failed"
         SOURCE_DIR="$BOOT_TMP/${REPO##*/}-$BRANCH"
     fi
-    [ -f "$SOURCE_DIR/src/main.swift" ] || die "fetched archive is missing src/main.swift"
+    [ -f "$SOURCE_DIR/src/daemon.py" ] || die "fetched archive is missing src/daemon.py"
     ok "Source ready."
 fi
 
-LOGO_PNG="$SOURCE_DIR/assets/AppIcon.png"
-
-# --- Prerequisite: Xcode Command Line Tools (clang + swiftc) ----------------
-# Required to compile on-device. If missing, launch Apple's installer and wait.
-if ! have clang || ! have swiftc; then
-    warn "Xcode Command Line Tools required (clang + swiftc)."
-    info "Launching Apple's installer — click ${BOLD}Install${RST} in the popup."
-    xcode-select --install >/dev/null 2>&1 || true
-    printf '%s' "${DIM}    waiting for the tools to finish installing"
-    while ! (have clang && have swiftc); do printf '.'; sleep 5; done
-    printf '%s\n' "${RST}"
-    ok "Command Line Tools ready."
+# --- Prerequisite: C compiler -------------------------------------------------
+if ! have gcc && ! have clang; then
+    info "Installing C compiler..."
+    case "$PM" in
+        pacman)  sudo pacman -S --noconfirm gcc ;;
+        apt)     sudo apt-get update && sudo apt-get install -y gcc ;;
+        dnf)     sudo dnf install -y gcc ;;
+        zypper)  sudo zypper install -y gcc ;;
+        nix)     nix-env -iA nixpkgs.gcc ;;
+        *)       die "Install gcc or clang manually, then re-run." ;;
+    esac
 fi
 
-# --- 1. Stage source into the install dir -----------------------------------
+# --- Prerequisite: python3 ---------------------------------------------------
+if ! have python3; then
+    info "Installing python3..."
+    case "$PM" in
+        pacman)  sudo pacman -S --noconfirm python ;;
+        apt)     sudo apt-get update && sudo apt-get install -y python3 ;;
+        dnf)     sudo dnf install -y python3 ;;
+        zypper)  sudo zypper install -y python3 ;;
+        nix)     nix-env -iA nixpkgs.python3 ;;
+        *)       die "Install python3 manually, then re-run." ;;
+    esac
+fi
+
+# --- Prerequisite: iptables ---------------------------------------------------
+if ! have iptables; then
+    info "Installing iptables..."
+    case "$PM" in
+        pacman)  sudo pacman -S --noconfirm iptables ;;
+        apt)     sudo apt-get update && sudo apt-get install -y iptables ;;
+        dnf)     sudo dnf install -y iptables ;;
+        zypper)  sudo zypper install -y iptables ;;
+        nix)     nix-env -iA nixpkgs.iptables ;;
+        *)       warn "iptables not found. Install it for firewall enforcement." ;;
+    esac
+fi
+
+# --- Detect display server for tray mode -------------------------------------
+HAS_DISPLAY=false
+if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    HAS_DISPLAY=true
+fi
+
+INSTALL_TRAY=false
+if [ "$HAS_DISPLAY" = true ]; then
+    # Check if pystray deps are available or can be installed
+    CAN_TRAY=false
+    if python3 -c "import pystray, PIL" 2>/dev/null; then
+        CAN_TRAY=true
+    fi
+
+    if [ "$CAN_TRAY" = true ]; then
+        printf '\n%sDo you want to install the system tray version? [Y/n] %s' "$BOLD" "$RST"
+        if [ -r /dev/tty ]; then
+            read -r ans < /dev/tty || ans=""
+        else
+            ans="y"
+        fi
+        case "$ans" in
+            [Nn]*) INSTALL_TRAY=false ;;
+            *)     INSTALL_TRAY=true ;;
+        esac
+    else
+        printf '\n%sDo you want to install the system tray version? %s\n' "$BOLD" "$RST"
+        printf '%s(Requires pystray + Pillow — will be installed via pip) [y/N] %s' "$DIM" "$RST"
+        if [ -r /dev/tty ]; then
+            read -r ans < /dev/tty || ans=""
+        else
+            ans="n"
+        fi
+        case "$ans" in
+            [Yy]*)
+                info "Installing pystray and Pillow..."
+                _tray_ok=false
+                # 1. Try system package manager first (Arch ships python-pillow)
+                case "$PM" in
+                    pacman)
+                        sudo pacman -S --noconfirm --needed python-pillow 2>/dev/null || true
+                        python3 -m pip install --user --break-system-packages pystray 2>/dev/null && _tray_ok=true
+                        ;;
+                    apt)
+                        sudo apt-get install -y python3-pil 2>/dev/null || true
+                        python3 -m pip install --user --break-system-packages pystray 2>/dev/null && _tray_ok=true
+                        ;;
+                    nix)
+                        nix-env -iA nixpkgs.python3Packages.pillow 2>/dev/null || true
+                        nix-env -iA nixpkgs.python3Packages.pystray 2>/dev/null && _tray_ok=true
+                        # Fallback to pip if not in nixpkgs
+                        if [ "$_tray_ok" = false ]; then
+                            python3 -m pip install --user pystray Pillow 2>/dev/null && _tray_ok=true
+                        fi
+                        ;;
+                    *)
+                        python3 -m pip install --user --break-system-packages pystray Pillow 2>/dev/null && _tray_ok=true
+                        ;;
+                esac
+                # 2. Fallback: plain pip without --break-system-packages
+                if [ "$_tray_ok" = false ]; then
+                    python3 -m pip install --user pystray Pillow 2>/dev/null && _tray_ok=true
+                fi
+                if python3 -c "import pystray, PIL" 2>/dev/null; then
+                    INSTALL_TRAY=true
+                    ok "pystray + Pillow installed."
+                else
+                    warn "pystray import failed. Using headless (systemd) mode."
+                fi
+                ;;
+            *)
+                INSTALL_TRAY=false ;;
+        esac
+    fi
+else
+    info "No display server detected. Installing headless (systemd) daemon."
+fi
+
+# --- 1. Stage source into install dir ----------------------------------------
 info "Installing to ${BOLD}$INSTALL_DIR${RST}"
 mkdir -p "$INSTALL_DIR/bin" "$INSTALL_DIR/src"
-/usr/bin/rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' \
-    "$SOURCE_DIR/src/" "$INSTALL_DIR/src/"
-for f in "$SOURCE_DIR/bin/"*; do
-    [ "$(basename "$f")" = "hosts-helper" ] && continue   # compiled below, never shipped
-    cp -R "$f" "$INSTALL_DIR/bin/"
-done
-
-# --- 2. Compile the native binaries -----------------------------------------
-# A previous install may have left a root-owned setuid hosts-helper behind; as a
-# regular user we can only remove-then-recreate (dir write perm governs unlink).
-info "Compiling privileged hosts helper (C)…"
-rm -f "$INSTALL_DIR/bin/hosts-helper" 2>/dev/null || sudo rm -f "$INSTALL_DIR/bin/hosts-helper"
-clang -O2 "$SOURCE_DIR/src/hosts_helper.c" -o "$INSTALL_DIR/bin/hosts-helper"
-
-info "Compiling native menu bar app (Swift)…"
-swiftc -O "$SOURCE_DIR/src/main.swift" -o "$INSTALL_DIR/bin/ClaudeGuardMenuBar"
-
-chmod +x "$INSTALL_DIR/bin/claudeguard" "$INSTALL_DIR/bin/ClaudeGuardMenuBar" \
-         "$INSTALL_DIR/src/cli_wrapper.py" "$INSTALL_DIR/src/app_launcher.py" \
-         "$INSTALL_DIR/src/helper.py"
-
-# --- 3. Build the .app bundle (icon + Info.plist) ---------------------------
-info "Creating ClaudeGuard.app bundle…"
-mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-
-if [ -f "$LOGO_PNG" ]; then
-    ICONSET_DIR="/tmp/AppIcon.iconset"; rm -rf "$ICONSET_DIR"; mkdir -p "$ICONSET_DIR"
-    for pair in "16:icon_16x16" "32:icon_16x16@2x" "32:icon_32x32" "64:icon_32x32@2x" \
-                "128:icon_128x128" "256:icon_128x128@2x" "256:icon_256x256" \
-                "512:icon_256x256@2x" "512:icon_512x512" "1024:icon_512x512@2x"; do
-        sz="${pair%%:*}"; nm="${pair#*:}"   # split without relying on word-splitting (bash+zsh safe)
-        sips -z "$sz" "$sz" "$LOGO_PNG" --out "$ICONSET_DIR/$nm.png" >/dev/null 2>&1
-    done
-    iconutil -c icns "$ICONSET_DIR" -o "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-    rm -rf "$ICONSET_DIR"
+if have rsync; then
+    rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '.DS_Store' \
+        "$SOURCE_DIR/src/" "$INSTALL_DIR/src/"
+    rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude 'hosts-helper' \
+        "$SOURCE_DIR/bin/" "$INSTALL_DIR/bin/"
 else
-    warn "assets/AppIcon.png not found — bundle will use the default icon."
+    find "$SOURCE_DIR/src" -maxdepth 1 -name '*.py' -exec cp {} "$INSTALL_DIR/src/" \;
+    find "$SOURCE_DIR/src" -maxdepth 1 -name '*.c' -exec cp {} "$INSTALL_DIR/src/" \;
+    for f in "$SOURCE_DIR/bin/"*; do
+        [ -d "$f" ] && continue
+        [ "$(basename "$f")" = "hosts-helper" ] && continue
+        cp "$f" "$INSTALL_DIR/bin/"
+    done
 fi
 
-cat > "$APP_BUNDLE/Contents/Info.plist" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleExecutable</key><string>ClaudeGuardMenuBar</string>
-    <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundleIdentifier</key><string>com.claudeguard.app</string>
-    <key>CFBundleName</key><string>ClaudeGuard</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSUIElement</key><true/>
-</dict>
-</plist>
-EOF
+# --- 2. Compile C helper -----------------------------------------------------
+info "Compiling privileged hosts helper (C)..."
+CC="gcc"
+have clang && CC="clang"
+rm -f "$INSTALL_DIR/bin/hosts-helper" 2>/dev/null || true
+$CC -O2 "$SOURCE_DIR/src/hosts_helper.c" -o "$INSTALL_DIR/bin/hosts-helper"
 
-cp "$INSTALL_DIR/bin/ClaudeGuardMenuBar" "$APP_BUNDLE/Contents/MacOS/ClaudeGuardMenuBar"
-mkdir -p "$HOME/Applications"
-ln -sf "$APP_BUNDLE" "$HOME/Applications/ClaudeGuard.app"
+chmod +x "$INSTALL_DIR/bin/claudeguard" \
+         "$INSTALL_DIR/src/cli_wrapper.py" "$INSTALL_DIR/src/app_launcher.py" \
+         "$INSTALL_DIR/src/helper.py" "$INSTALL_DIR/src/daemon.py"
 
-# --- 4. Symlink the manager CLI ---------------------------------------------
-info "Installing the 'claudeguard' manager…"
+# --- 3. Symlink the manager CLI ----------------------------------------------
+info "Installing the 'claudeguard' manager..."
 mkdir -p "$HOME/.local/bin" "$CONFIG_DIR"
 ln -sf "$INSTALL_DIR/bin/claudeguard" "$HOME/.local/bin/claudeguard"
-[ -w "/usr/local/bin" ] && ln -sf "$INSTALL_DIR/bin/claudeguard" "/usr/local/bin/claudeguard"
+if [ -w "/usr/local/bin" ]; then
+    ln -sf "$INSTALL_DIR/bin/claudeguard" "/usr/local/bin/claudeguard"
+fi
 
-# --- 5. Hook the `claude` CLI + locate Claude Desktop ------------------------
-# Delegated to src/integrity.py, the same code the daemon runs on a timer, so a
-# fresh install and a later self-heal can't disagree about where Claude lives.
-info "Hooking the 'claude' command…"
+# --- 4. Hook the `claude` CLI + locate Claude Desktop -------------------------
+info "Hooking the 'claude' command..."
 REPAIR_OUT="$(cd "$INSTALL_DIR" && python3 -c "
 import sys
 sys.path.insert(0, '.')
@@ -190,83 +262,82 @@ else
     warn "    claudeguard set-cli-path /path/to/real/claude"
 fi
 
-# --- 6. LaunchAgent (autostart at login) ------------------------------------
-info "Registering login-autostart LaunchAgent…"
-mkdir -p "$HOME/Library/LaunchAgents"
-cat > "$PLIST_PATH" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.claudeguard.daemon</string>
-    <key>ProgramArguments</key>
-    <array><string>$INSTALL_DIR/bin/ClaudeGuardMenuBar</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-    <key>StandardOutPath</key><string>/tmp/claudeguard.log</string>
-    <key>StandardErrorPath</key><string>/tmp/claudeguard.err</string>
-</dict>
-</plist>
+# --- 5. systemd user service (daemon) ----------------------------------------
+info "Creating systemd user service..."
+mkdir -p "$SYSTEMD_USER_DIR"
+
+DAEMON_ARGS=""
+if [ "$INSTALL_TRAY" = true ]; then
+    DAEMON_ARGS=" --tray"
+fi
+
+cat > "$SYSTEMD_USER_DIR/claudeguard.service" <<EOF
+[Unit]
+Description=ClaudeGuard VPN whitelist daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$(command -v python3) $INSTALL_DIR/src/daemon.py${DAEMON_ARGS}
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=${DISPLAY:-}
+Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}
+Environment=DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-}
+Environment=XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+
+[Install]
+WantedBy=default.target
 EOF
-pkill -f "ClaudeGuardMenuBar" 2>/dev/null || true
-launchctl unload "$PLIST_PATH" 2>/dev/null || true
-launchctl load "$PLIST_PATH" 2>/dev/null || true
 
-# --- 7. Root network helper via a LaunchDaemon (no sudoers) ------------------
-# The user-session daemon has no root; it stages the desired /etc/hosts + pf
-# rule in ~/.config/claudeguard/pending and touches a trigger file. This root
-# LaunchDaemon watches that trigger and applies the vetted files. Needs your
-# password ONCE now (to place the root-owned binary + plist); never again.
-info "Installing the root network helper (LaunchDaemon — needs your password once)…"
+systemctl --user daemon-reload
+systemctl --user enable claudeguard.service 2>/dev/null || true
+systemctl --user restart claudeguard.service 2>/dev/null || true
+ok "systemd user service installed and started."
 
-# Private staging dir + trigger file the helper watches (must exist before load).
+# --- 6. Root helper via systemd (path + service) ------------------------------
+info "Installing the root network helper (needs your password once)..."
 mkdir -p "$CONFIG_DIR/pending"
 chmod 700 "$CONFIG_DIR/pending"
 [ -f "$CONFIG_DIR/pending/request" ] || : > "$CONFIG_DIR/pending/request"
 
-HELPER_PLIST_BODY="<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-    <key>Label</key><string>com.claudeguard.helper</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HELPER_SYS_DIR/hosts-helper</string>
-        <string>$CONFIG_DIR</string>
-    </array>
-    <key>WatchPaths</key>
-    <array><string>$CONFIG_DIR/pending/request</string></array>
-    <key>StandardOutPath</key><string>/tmp/claudeguard-helper.log</string>
-    <key>StandardErrorPath</key><string>/tmp/claudeguard-helper.err</string>
-</dict>
-</plist>"
+HELPER_SERVICE="[Unit]
+Description=ClaudeGuard root helper
 
-install_root_helper() {   # $1 = sudo prefix ("" when already root)
+[Service]
+Type=oneshot
+ExecStart=$HELPER_SYS_DIR/hosts-helper $CONFIG_DIR"
+
+HELPER_PATH="[Unit]
+Description=ClaudeGuard root helper trigger
+
+[Path]
+PathChanged=$CONFIG_DIR/pending/request
+
+[Install]
+WantedBy=multi-user.target"
+
+install_root_helper() {
     local S="$1"
     $S mkdir -p "$HELPER_SYS_DIR"
     $S cp "$INSTALL_DIR/bin/hosts-helper" "$HELPER_SYS_DIR/hosts-helper"
-    $S chown root:wheel "$HELPER_SYS_DIR" "$HELPER_SYS_DIR/hosts-helper"
-    $S chmod 755 "$HELPER_SYS_DIR/hosts-helper"     # root-owned, not user-writable
-    printf '%s\n' "$HELPER_PLIST_BODY" | $S tee "$HELPER_PLIST" >/dev/null
-    $S chown root:wheel "$HELPER_PLIST"
-    $S chmod 644 "$HELPER_PLIST"
-    $S launchctl bootout system "$HELPER_PLIST" 2>/dev/null || true
-    $S launchctl bootstrap system "$HELPER_PLIST" 2>/dev/null \
-        || $S launchctl load -w "$HELPER_PLIST" 2>/dev/null || true
+    $S chown root:root "$HELPER_SYS_DIR" "$HELPER_SYS_DIR/hosts-helper"
+    $S chmod 755 "$HELPER_SYS_DIR/hosts-helper"
+    printf '%s\n' "$HELPER_SERVICE" | $S tee /etc/systemd/system/claudeguard-helper.service >/dev/null
+    printf '%s\n' "$HELPER_PATH"    | $S tee /etc/systemd/system/claudeguard-helper.path    >/dev/null
+    $S systemctl daemon-reload
+    $S systemctl enable claudeguard-helper.path 2>/dev/null || true
+    $S systemctl restart claudeguard-helper.path 2>/dev/null || true
 }
 
 if [ "$(id -u)" -eq 0 ]; then
-    rm -f "$LEGACY_SUDOERS" 2>/dev/null || true
     install_root_helper ""
 else
-    sudo rm -f "$LEGACY_SUDOERS" 2>/dev/null || true   # drop old NOPASSWD entry if upgrading
     install_root_helper "sudo"
 fi
-# The compiled copy in the user dir is never executed now; drop it.
 rm -f "$INSTALL_DIR/bin/hosts-helper" 2>/dev/null || true
 
-# --- 8. First-run: offer to whitelist the current public IP -----------------
-# Best done while you're connected to your VPN right now.
+# --- 7. First-run: offer to whitelist the current public IP -------------------
 CUR_IP="$(cd "$INSTALL_DIR" && python3 -c 'import sys; sys.path.insert(0,"."); from src.ip_checker import stun_public_ip; print(stun_public_ip() or "")' 2>/dev/null || true)"
 if [ -n "$CUR_IP" ] && [ -r /dev/tty ]; then
     printf '\n%sYour current public IP is %s%s%s.\n' "$BOLD" "$CYN" "$CUR_IP" "$RST"
@@ -278,10 +349,16 @@ if [ -n "$CUR_IP" ] && [ -r /dev/tty ]; then
     esac
 fi
 
-printf '\n%s\n' "${GRN}${BOLD}🎉 ClaudeGuard installed & running.${RST}"
-printf '%s\n' "   Look for the shield in your macOS menu bar."
-printf '%s\n' "   ${DIM}Manage it:${RST} ${BOLD}claudeguard status${RST}  ·  ${BOLD}claudeguard add-ip <IP>${RST}"
+printf '\n%s\n' "${GRN}${BOLD}ClaudeGuard installed & running.${RST}"
+if [ "$INSTALL_TRAY" = true ]; then
+    printf '%s\n' "   Mode: system tray (look for the shield icon)."
+else
+    printf '%s\n' "   Mode: headless systemd daemon."
+fi
+printf '%s\n' "   ${DIM}Manage it:${RST} ${BOLD}claudeguard status${RST}  |  ${BOLD}claudeguard add-ip <IP>${RST}"
 if ! printf '%s' "$PATH" | tr ':' '\n' | grep -qx "$HOME/.local/bin"; then
-    printf '%s\n' "   ${YLW}Note:${RST} add ~/.local/bin to your PATH to use 'claudeguard' directly:"
-    printf '%s\n' "         ${DIM}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc${RST}"
+    printf '%s\n' "   ${YLW}Note:${RST} add ~/.local/bin to your PATH:"
+    SHELL_RC="$HOME/.bashrc"
+    [ -n "${ZSH_VERSION:-}" ] || [ "$(basename "${SHELL:-}")" = "zsh" ] && SHELL_RC="$HOME/.zshrc"
+    printf '%s\n' "         ${DIM}echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> $SHELL_RC${RST}"
 fi

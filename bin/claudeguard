@@ -4,7 +4,6 @@ import os
 import subprocess
 import json
 
-# Ensure src module can be imported even when run via symlink
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.realpath(__file__)), ".."))
 sys.path.insert(0, PROJECT_DIR)
 
@@ -14,9 +13,12 @@ from src.integrity import cli_hook_status, repair, repair_cli
 from src.network_guard import sync_hosts_file
 from src.update_guard import apply_auto_update_lock
 
+SERVICE_NAME = "claudeguard.service"
+
+
 def print_help():
     help_text = """
-ClaudeGuard CLI - VPN Whitelist & Auto-Update Control for Claude
+ClaudeGuard CLI - VPN Whitelist & Auto-Update Control for Claude (Linux)
 
 Usage:
   claudeguard <command> [options]
@@ -35,14 +37,14 @@ Commands:
   enable-model         Enable model override for every claude session
   disable-model        Disable model override
   launch-desktop       Launch Claude Desktop with pre-flight IP verification
-  start                Start ClaudeGuard Menu Bar App
-  stop                 Stop ClaudeGuard Menu Bar App
+  start                Start ClaudeGuard daemon (systemd user service)
+  stop                 Stop ClaudeGuard daemon
   doctor               Check every hook is still attached, and re-attach it
   install-cli-wrapper  Install 'claude' CLI wrapper interceptor into PATH
   set-cli-path <path>  Set the real Claude CLI binary path ClaudeGuard launches
-  uninstall            Uninstall ClaudeGuard LaunchAgent and wrappers
 """
     print(help_text.strip())
+
 
 def main():
     if len(sys.argv) < 2:
@@ -62,12 +64,10 @@ def main():
             print(f"Default Model      : off")
         print(f"Whitelisted IPs    : {', '.join(config.allowed_ips) if config.allowed_ips else 'NONE (Access Blocked)'}")
 
-        # Same verdict the wrapper and launcher enforce; show its source.
         up = daemon_is_up()
         print(f"Decision Source    : {'🧠 Daemon (live state.json)' if up else '🔌 Local check (daemon down)'}")
         print("\nPerforming IP check..." if not up else "")
         verdict, ip, err = get_verdict(config, timeout=2.0)
-        # get_verdict returns ip=None when protection is off; show the real IP.
         if ip is None:
             ip = resolve_display_ip(config, timeout=2.0)
         print(f"Current Public IP  : {ip or 'OFFLINE/UNKNOWN'}")
@@ -151,18 +151,27 @@ def main():
         os.execv(sys.executable, [sys.executable, launcher])
 
     elif cmd in ("start", "launch", "open"):
-        plist = os.path.expanduser("~/Library/LaunchAgents/com.claudeguard.daemon.plist")
-        app_path = os.path.expanduser("~/.local/share/ClaudeGuard/bin/ClaudeGuardMenuBar")
-        subprocess.run(["launchctl", "load", plist], capture_output=True)
-        if not os.system("pgrep -f ClaudeGuardMenuBar >/dev/null") == 0:
-            subprocess.Popen([app_path])
-        print("🚀 ClaudeGuard Menu Bar App launched.")
+        r = subprocess.run(["systemctl", "--user", "start", SERVICE_NAME],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            print("🚀 ClaudeGuard daemon started.")
+        else:
+            daemon_path = os.path.join(PROJECT_DIR, "src", "daemon.py")
+            if not _is_daemon_running():
+                subprocess.Popen([sys.executable, daemon_path],
+                                 start_new_session=True,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+                print("🚀 ClaudeGuard daemon started (standalone).")
+            else:
+                print("ClaudeGuard daemon is already running.")
 
     elif cmd in ("stop", "quit", "close"):
-        plist = os.path.expanduser("~/Library/LaunchAgents/com.claudeguard.daemon.plist")
-        subprocess.run(["launchctl", "unload", plist], capture_output=True)
-        subprocess.run(["pkill", "-f", "ClaudeGuardMenuBar"], check=False)
-        print("🛑 ClaudeGuard Menu Bar App stopped.")
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME],
+                       capture_output=True)
+        subprocess.run(["pkill", "-f", "daemon.py.*ClaudeGuard"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("🛑 ClaudeGuard daemon stopped.")
 
     elif cmd in ("doctor", "repair"):
         doctor(config)
@@ -170,15 +179,16 @@ def main():
     elif cmd == "install-cli-wrapper":
         report = repair_cli(config)
         for change in report["changed"]:
-            print(f"✅ {change}")
+            print(f"  {change}")
         for note in report["notes"]:
-            print(f"⚠️  {note}")
+            print(f"  {note}")
         if not report["changed"] and not report["notes"]:
-            print("✅ 'claude' interceptor already installed and current.")
+            print("'claude' interceptor already installed and current.")
 
     elif cmd == "set-cli-path":
         if len(sys.argv) < 3:
-            print("Error: Specify the real claude binary path. Example: claudeguard set-cli-path /opt/homebrew/bin/claude")
+            print("Error: Specify the real claude binary path. "
+                  "Example: claudeguard set-cli-path ~/.local/bin/claude")
             sys.exit(1)
         path = os.path.realpath(sys.argv[2])
         if not os.path.isfile(path):
@@ -186,16 +196,24 @@ def main():
             sys.exit(1)
         config.config["real_claude_cli_path"] = path
         config.save_config()
-        print(f"✅ Real Claude CLI path set to '{path}'.")
+        print(f"Real Claude CLI path set to '{path}'.")
 
     else:
         print(f"Unknown command: {cmd}")
         print_help()
         sys.exit(1)
 
+
+def _is_daemon_running():
+    try:
+        r = subprocess.run(["pgrep", "-f", "daemon.py.*ClaudeGuard"],
+                           capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 def doctor(config):
-    """Report on every hook ClaudeGuard owns, then re-attach whatever came loose.
-    The command to run after Claude Code or Claude Desktop was reinstalled."""
     print("=== ClaudeGuard Doctor ===\n")
 
     report = repair(config)
@@ -204,37 +222,53 @@ def doctor(config):
     print("Claude Code CLI")
     if hooks:
         for hook in hooks:
-            mark = "🟢" if hook["guarded"] else "🔴"
+            mark = "[OK]" if hook["guarded"] else "[!!]"
             where = "" if hook["on_path"] else "  (not on your PATH)"
             what = "guarded by ClaudeGuard" if hook["guarded"] else "REAL binary — UNGUARDED"
-            print(f"  {mark} {hook['path']} → {what}{where}")
+            print(f"  {mark} {hook['path']} -> {what}{where}")
     else:
-        print("  ⚪ no 'claude' command found in any known bin directory")
+        print("  [--] no 'claude' command found in any known bin directory")
     print(f"  Hands off to      : {report['real_cli'] or 'NOT FOUND'}")
-    print(f"  Verdict           : {'🟢 intercepted' if intercepted else '🔴 NOT intercepted'}")
+    print(f"  Verdict           : {'[OK] intercepted' if intercepted else '[!!] NOT intercepted'}")
 
     print("\nClaude Desktop")
     if report["desktop_app"]:
-        print(f"  🟢 {report['desktop_app']} (guarded by the menu bar daemon)")
+        print(f"  [OK] {report['desktop_app']} (guarded by daemon)")
     else:
-        print("  ⚪ not installed")
+        print("  [--] not installed")
 
     print("\nDaemon")
-    print(f"  {'🟢 running' if daemon_is_up() else '🔴 NOT running — run: claudeguard start'}")
+    up = daemon_is_up()
+    svc = subprocess.run(["systemctl", "--user", "is-active", SERVICE_NAME],
+                         capture_output=True, text=True)
+    if up:
+        print("  [OK] running")
+    elif svc.returncode == 0:
+        print("  [OK] systemd service active (state.json not yet fresh)")
+    else:
+        print("  [!!] NOT running — run: claudeguard start")
 
-    print("\nWebsite blocking")
-    print(f"  {'🟢 /etc/hosts writable by the root helper' if os.path.exists('/Library/LaunchDaemons/com.claudeguard.helper.plist') else '🔴 root helper missing — re-run install.sh'}")
+    print("\nRoot helper")
+    helper_svc = subprocess.run(
+        ["systemctl", "is-active", "claudeguard-helper.path"],
+        capture_output=True, text=True,
+    )
+    if helper_svc.stdout.strip() == "active":
+        print("  [OK] claudeguard-helper.path active")
+    else:
+        print("  [!!] claudeguard-helper.path not active — re-run install.sh")
 
     if report["changed"]:
         print("\nRepaired:")
         for change in report["changed"]:
-            print(f"  ✅ {change}")
+            print(f"  + {change}")
     if report["notes"]:
         print("\nNotes:")
         for note in report["notes"]:
-            print(f"  ⚠️  {note}")
+            print(f"  ! {note}")
     if not report["changed"]:
-        print("\n✅ Nothing to repair.")
+        print("\nNothing to repair.")
+
 
 if __name__ == "__main__":
     main()

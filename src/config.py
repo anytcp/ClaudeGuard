@@ -34,8 +34,8 @@ DEFAULT_CONFIG = {
     "update_domains": [
         "desktop-app-updates.anthropic.com"
     ],
-    "real_claude_cli_path": "/opt/homebrew/bin/claude",
-    "real_claude_app_path": "/Applications/Claude.app"
+    "real_claude_cli_path": os.path.expanduser("~/.local/bin/claude"),
+    "real_claude_app_path": ""
 }
 
 class ConfigManager:
@@ -133,8 +133,8 @@ class ConfigManager:
 
     @property
     def real_claude_cli(self):
-        return self.config.get("real_claude_cli_path", "/opt/homebrew/bin/claude")
+        return self.config.get("real_claude_cli_path", os.path.expanduser("~/.local/bin/claude"))
 
     @property
     def real_claude_app(self):
-        return self.config.get("real_claude_app_path", "/Applications/Claude.app")
+        return self.config.get("real_claude_app_path", "")

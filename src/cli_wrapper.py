@@ -98,21 +98,21 @@ def main():
     run_real_claude(config)
 
 def monitor_and_enforce(config, proc, stop_event, block_info):
-    """Re-checks the verdict for the child's lifetime; kills it on a confirmed
-    "blocked". The banner is NOT printed here (Claude owns the TUI and would
-    swallow it) — we stash details in block_info and let the main thread print
-    after Claude exits. On "offline" we do nothing: no point killing a session
-    over a Wi-Fi blip."""
+    """Re-checks the verdict for the child's lifetime; kills it on "blocked" or
+    "offline". Fail closed: only a confirmed "allowed" (or protection disabled)
+    lets the session continue. The banner is NOT printed here (Claude owns the
+    TUI and would swallow it) — we stash details in block_info and let the main
+    thread print after Claude exits."""
     while not stop_event.wait(MONITOR_INTERVAL_SECONDS):
         if proc.poll() is not None:
-            return  # child already exited on its own
+            return
 
         config.config = config.load_config()
         if not config.protection_enabled:
             continue
 
         verdict, ip, err = get_verdict(config)
-        if verdict != "blocked":
+        if verdict in ("allowed", "disabled"):
             continue
 
         block_info["blocked"] = True
@@ -189,7 +189,7 @@ def run_real_claude(config):
     elif config.protection_enabled and rc != 0:
         config.config = config.load_config()
         verdict, ip, err = get_verdict(config)
-        if verdict == "blocked":
+        if verdict in ("blocked", "offline"):
             banner_ip, banner_err = ip, err
 
     if banner_ip is not None:

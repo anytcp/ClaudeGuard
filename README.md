@@ -1,10 +1,10 @@
 <div align="center">
 
-# 🛡️ ClaudeGuard
+# ClaudeGuard
 
-**A VPN-whitelist guard for Claude on macOS.**
+**A VPN-whitelist guard for Claude on Linux.**
 
-Blocks the **Claude Desktop** app, the **Claude Code CLI** (`claude`) and every Claude/Anthropic domain (`claude.ai`, `claude.com`, `anthropic.com` and all their subdomains) whenever your public IP is not on your VPN whitelist - so you never touch Claude from the wrong region by accident.
+Blocks the **Claude Desktop** app (Electron), the **Claude Code CLI** (`claude`) and every Claude/Anthropic domain (`claude.ai`, `claude.com`, `anthropic.com` and all their subdomains) whenever your public IP is not on your VPN whitelist - so you never touch Claude from the wrong region by accident.
 
 **English** · [Русский](README.ru.md)
 
@@ -19,38 +19,43 @@ ClaudeGuard solves that: every launch and every running session is checked again
 
 ## Features
 
-- 🔐 **IP whitelist** - Claude opens **only** when your public IP matches one of your VPN nodes.
-- ⏱ **Instant pre-flight check** - launching `claude` or `Claude.app` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted → blocked before anything connects.
-- 🧠 **One brain, one verdict** - a background daemon publishes the decision to a state file; the CLI, the app launcher and the menu bar all read the same verdict, so nothing can disagree.
-- 🚀 **Autostart at login** via `LaunchAgent`.
-- 🟢 **Menu bar UI** - live status (🟢 protected / 🔴 blocked / ⚪ offline / 🟡 off), toggles, one-click whitelist.
-- ❄️ **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
-- 🤖 **Default model override** - pin a model for every `claude` session (e.g. `claude-opus-4-8`) from the menu bar; the CLI wrapper injects `--model` automatically so you don't have to type it each time.
+- **IP whitelist** - Claude opens **only** when your public IP matches one of your VPN nodes.
+- **Instant pre-flight check** - launching `claude` verifies the public IP in < 0.5s (STUN over UDP). Not whitelisted = blocked before anything connects.
+- **One brain, one verdict** - a background daemon publishes the decision to a state file; the CLI and the app launcher read the same verdict, so nothing can disagree.
+- **Autostart at login** via systemd user service.
+- **Two daemon modes** - headless (systemd, for servers) or system tray icon (for desktops with X11/Wayland via pystray).
+- **Freeze auto-updates** - blocks Claude's update servers and locks the update dirs.
+- **Default model override** - pin a model for every `claude` session (e.g. `claude-opus-4-8`); the CLI wrapper injects `--model` automatically.
+- **Claude Desktop guard** - detects and kills Electron-based Claude Desktop when blocked.
 
 ## Install
 
-The installer compiles the native binaries (Swift + C) **on your machine**. Locally-compiled binaries
-carry no quarantine flag, so **Gatekeeper never blocks them** - no Apple Developer account, no code-signing,
-no notarization, no Homebrew. The only requirement is Xcode Command Line Tools (the installer offers to
-install them if missing).
+The installer compiles the C root helper **on your machine** with gcc/clang.
+Python 3 and iptables are installed automatically if missing (pacman/apt/dnf/zypper/nix-env).
 
 Two ways to install - both give the exact same result.
 
 **Option 1 - one line** (downloads and builds from GitHub):
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ivblz/ClaudeGuard/main/install.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/anytcp/ClaudeGuard/main/install.sh)"
 ```
 
-**Option 2 - from a local copy** (a cloned or downloaded repo; never touches GitHub):
+**Option 2 - from a local copy** (a cloned or downloaded repo):
 
 ```bash
 ./install.sh
 ```
 
-Either way it compiles for your architecture (Apple Silicon or Intel), installs the menu bar daemon at login,
-and wraps the `claude` command. It asks for your password once (`sudo` is needed to edit `/etc/hosts` and pf)
-and offers to whitelist your current IP - accept **only if you are on your VPN right now.**
+The installer will:
+1. Compile the C root helper with gcc.
+2. Ask whether you want **system tray mode** (requires pystray + Pillow) or **headless mode** (pure systemd). If no display server is detected, headless is chosen automatically.
+3. Create a systemd user service for the daemon and a systemd path unit for the root helper.
+4. Hook the `claude` command so every invocation goes through ClaudeGuard first.
+5. Ask for your password once (`sudo` is needed for `/etc/hosts` and iptables).
+6. Offer to whitelist your current IP - accept **only if you are on your VPN right now.**
+
+**Supported distros:** Arch, Debian/Ubuntu, Fedora, openSUSE, NixOS - anything with systemd and a C compiler.
 
 **Uninstall:**
 
@@ -73,7 +78,7 @@ After install the `claudeguard` command is available:
 | `claudeguard set-model <model>` | Set the default model (e.g. `claude-opus-4-8`) |
 | `claudeguard enable-model` / `disable-model` | Turn the model override on / off |
 | `claudeguard launch-desktop` | Launch Claude Desktop with a pre-flight check |
-| `claudeguard start` / `stop` | Start / stop the menu bar daemon |
+| `claudeguard start` / `stop` | Start / stop the daemon (via systemd) |
 | `claudeguard doctor` | Check every hook is still attached, and re-attach it |
 | `claudeguard set-cli-path <path>` | Point at the real `claude` binary if auto-detect misses it |
 
@@ -81,8 +86,7 @@ After install the `claudeguard` command is available:
 
 Reinstalling Claude Code puts the real `claude` binary back over ClaudeGuard's shim,
 and updating it deletes the version-stamped path the shim hands off to - so the guard
-would silently detach while the menu bar still showed 🟢. The same applies to Claude
-Desktop, whose bundle id and update directories have been renamed before.
+would silently detach while the daemon still reports "allowed".
 
 ClaudeGuard therefore discovers those locations instead of hard-coding them, and
 re-attaches whatever came loose: the daemon self-heals **every 60s**, the `claude`
@@ -94,28 +98,30 @@ it immediately) at any time.
 
 1. **STUN-first IP detection** - the public IP is resolved via a single UDP STUN round-trip (tens of ms), falling back to HTTP echo services on networks that block UDP.
 2. **The brain** (`src/brain.py`) turns that IP into one verdict - `allowed` / `blocked` / `offline` - and it **fails closed**: only a confirmed `allowed` lets Claude run.
-3. **Single source of truth** - the menu bar daemon writes its verdict to `~/.config/claudeguard/state.json` on every check. The CLI wrapper and app launcher read it (instant), and fall back to their own check only if the daemon is down.
-4. **Enforcement** - the whole Claude/Anthropic domain family (~175 hosts across 5 apex domains) is blocked via `/etc/hosts` + a pf firewall rule (TCP + UDP/QUIC); the desktop app is force-quit with an alert; a running `claude` session is killed the moment the IP leaves the whitelist.
+3. **Single source of truth** - the daemon writes its verdict to `~/.config/claudeguard/state.json` on every check. The CLI wrapper and launcher read it (instant), and fall back to their own check only if the daemon is down.
+4. **Enforcement** - the whole Claude/Anthropic domain family (~175 hosts across 5 apex domains) is blocked via `/etc/hosts` + iptables rules (TCP + UDP/QUIC); Claude Desktop (Electron) is killed; a running `claude` session is terminated the moment the IP leaves the whitelist.
+5. **Root helper** - a systemd path unit watches a trigger file; when the user daemon touches it, a root service applies the staged `/etc/hosts` and iptables rules. No sudoers, no setuid.
 
-> **Scope:** this is accidental-leak protection for your own machine, not a defense against a malicious admin. The truly unbypassable layer (a Network Extension content filter) requires a paid Apple Developer account; the on-device approach here is the free ceiling and covers accidental leaks well.
+> **Scope:** this is accidental-leak protection for your own machine, not a defense against a malicious admin.
 
 ## Project structure
 
 ```
 src/
-  brain.py          The single decision core (reads the daemon verdict; STUN fallback)
-  ip_checker.py     Public-IP detection: STUN over UDP, then HTTP
+  brain.py          Decision core (reads daemon verdict; STUN fallback)
+  ip_checker.py     Public IP detection: STUN over UDP, then HTTP
   config.py         Config at ~/.config/claudeguard/config.json
-  network_guard.py  /etc/hosts + pf firewall block/unblock
+  network_guard.py  Block/unblock via /etc/hosts + iptables
   update_guard.py   Freeze/unfreeze Claude auto-updates
-  integrity.py      Finds Claude's real paths; re-attaches hooks after a reinstall
+  integrity.py      Discovers real Claude paths; re-hooks after reinstall
   cli_wrapper.py    Pre-flight interceptor for the `claude` command
-  app_launcher.py   Pre-flight interceptor for Claude.app
-  main.swift        Native menu bar daemon (AppKit): monitoring, alerts, state file
-  hosts_helper.c    Root helper run by a LaunchDaemon (no sudoers, no setuid); writes /etc/hosts + pf
+  app_launcher.py   Pre-flight interceptor for Claude Desktop
+  daemon.py         Background daemon (systemd): monitoring, enforcement, state file
+  tray.py           Optional system tray icon (pystray + Pillow)
+  hosts_helper.c    Root helper (systemd): writes /etc/hosts + iptables
+  helper.py         Dispatcher for daemon -> helper calls
 bin/claudeguard     Management CLI
-assets/AppIcon.png  App icon
-install.sh          Compiles natively on-device and installs everything
+install.sh          Compiles natively and installs everything
 uninstall.sh        Clean removal, restores the original `claude`
 ```
 

@@ -5,7 +5,7 @@ from src.integrity import desktop_update_paths
 
 
 def apply_auto_update_lock(block_updates):
-    """Lock/unlock Claude Desktop's auto-update state (chmod + chflags uchg).
+    """Lock/unlock Claude Desktop's auto-update state (chmod + chattr on Linux).
 
     Paths are discovered, not hard-coded: they're keyed on a bundle id that has
     already been renamed once, and a stale one doesn't error — it silently
@@ -20,9 +20,11 @@ def apply_auto_update_lock(block_updates):
             recursive = ["-R"] if os.path.isdir(path) else []
             if block_updates:
                 subprocess.run(["chmod"] + recursive + ["444", path], check=False)
-                subprocess.run(["chflags"] + recursive + ["uchg", path], check=False)
+                subprocess.run(["chattr"] + recursive + ["+i", path],
+                               check=False, stderr=subprocess.DEVNULL)
             else:
-                subprocess.run(["chflags"] + recursive + ["nouchg", path], check=False)
+                subprocess.run(["chattr"] + recursive + ["-i", path],
+                               check=False, stderr=subprocess.DEVNULL)
                 subprocess.run(["chmod"] + recursive + ["755" if os.path.isdir(path) else "644", path],
                                check=False)
 
